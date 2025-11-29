@@ -1,5 +1,5 @@
 # --- Experiment configurations --------------------------------------------------------------------
-experiment_name: test_run
+experiment_name: persistent_hourly_test
 
 run_dir:
 
@@ -28,13 +28,16 @@ metrics:
   - Beta-NSE
 
 # --- Model configuration --------------------------------------------------------------------------
-model: cudalstm
+model: persistentlstm              # <--- use your new model
 head: regression
 output_activation: linear
 
-hidden_size: 16
+hidden_size: 128
 initial_forget_bias: 3
 output_dropout: 0.4
+
+# turn on persistent behavior in BaseTrainer
+persistent_state: true             # <--- NEW
 
 # --- Training configuration -----------------------------------------------------------------------
 optimizer: Adam
@@ -43,25 +46,28 @@ learning_rate:
   0: 1e-3
   10: 5e-4
   20: 1e-4
-batch_size: 256
-epochs: 30
+
+batch_size: 64                  # smaller is safer for testing
+epochs: 15                          # keep small for now while debugging
 clip_gradient_norm: 1
 
-predict_last_n: 1
-seq_length: 720
+# use ALL timesteps in each sequence for the loss
+seq_length: 24                    # like your standalone code
+predict_last_n: 24                # must equal seq_length
 
 num_workers: 0
 log_interval: 5
-log_tensorboard: True
-log_n_figures: 2
+log_tensorboard: False             # can set True later
+log_n_figures: 1
 save_weights_every: 1
 save_validation_results: False
 
 # --- Data configurations --------------------------------------------------------------------------
-dataset: hourly_camels_us # will be filled by conftest
+dataset: hourly_camels_us          # will be filled by conftest
 data_dir: ./test/test_data/camels_us
-forcings: nldas_hourly # will be filled by conftest
-dynamic_inputs: # will be filled by conftest
+forcings: nldas_hourly
+# will be filled by conftest
+dynamic_inputs:                    # will be filled by conftest
   - total_precipitation
   - temperature
 target_variables:
@@ -69,3 +75,8 @@ target_variables:
 static_attributes:
   - elev_mean
   - slope_mean
+
+# --- Persistent sampling configuration ------------------------------------------------------------
+# Non-overlapping windows for persistent LSTM
+non_overlapping_sequences: true    # <--- NEW
+seq_stride: 24                  # <--- NEW (usually = seq_length)

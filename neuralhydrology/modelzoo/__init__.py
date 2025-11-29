@@ -21,6 +21,8 @@ from neuralhydrology.modelzoo.transformer import Transformer
 from neuralhydrology.utils.config import Config
 
 from neuralhydrology.modelzoo.x_lstm import XLSTM
+from neuralhydrology.modelzoo.persistentlstm import PersistentLSTMModel
+
 
 SINGLE_FREQ_MODELS = [
     "cudalstm",
@@ -102,6 +104,8 @@ def get_model(cfg: Config) -> nn.Module:
         model = StackedForecastLSTM(cfg=cfg)
     elif cfg.model.lower() == "hybrid_model":
         model = HybridModel(cfg=cfg)
+    elif cfg.model.lower() == "persistentlstm":
+        model = PersistentLSTMModel(cfg=cfg)
     else:
         raise NotImplementedError(f"{cfg.model} not implemented or not linked in `get_model()`")
 

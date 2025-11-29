@@ -58,6 +58,13 @@ class BaseTrainer(object):
         self._dynamic_learning_rate = cfg.dynamic_learning_rate
         self._patience_dynamic_learning_rate = cfg.patience_dynamic_learning_rate
         self._factor_dynamic_learning_rate = cfg.factor_dynamic_learning_rate
+        # --------------------------------------------------
+        # Persistent LSTM support (optional, backward-safe)
+        # --------------------------------------------------
+        self.persistent_state = getattr(self.cfg, "persistent_state", False)
+        self._persistent_hidden = None
+        self._current_basin_idx = None
+
 
         # load train basin list and add number of basins to the config
         self.basins = load_basin_file(cfg.train_basin_file)
@@ -100,13 +107,26 @@ class BaseTrainer(object):
 
     def _get_tester(self) -> BaseTester:
         return get_tester(cfg=self.cfg, run_dir=self.cfg.run_dir, period="validation", init_model=False)
-
     def _get_data_loader(self, ds: BaseDataset) -> torch.utils.data.DataLoader:
-        return DataLoader(ds,
-                          batch_size=self.cfg.batch_size,
-                          shuffle=True,
-                          num_workers=self.cfg.num_workers,
-                          collate_fn=ds.collate_fn)
+        # For persistent LSTM we want strict temporal order (no shuffling)
+        shuffle = True
+        if getattr(self.cfg, "persistent_state", False) and self.cfg.model.lower() == "persistentlstm":
+            shuffle = False
+
+        return DataLoader(
+            ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=shuffle,
+            num_workers=self.cfg.num_workers,
+            collate_fn=ds.collate_fn,
+        )
+
+    #def _get_data_loader(self, ds: BaseDataset) -> torch.utils.data.DataLoader:
+        #return DataLoader(ds,
+                        #  batch_size=self.cfg.batch_size,
+                         # shuffle=True,
+                        #  num_workers=self.cfg.num_workers,
+                         # collate_fn=ds.collate_fn)
 
     def _freeze_model_parts(self):
         # freeze all model weights
@@ -298,6 +318,9 @@ class BaseTrainer(object):
     def _train_epoch(self, epoch: int):
         self.model.train()
         self.experiment_logger.train()
+        # Reset *all* basin states at the start of each epoch
+        if self.persistent_state and self.cfg.model.lower() == "persistentlstm":
+            self._persistent_hidden = {}
 
         # process bar handle
         n_iter = min(self._max_updates_per_epoch, len(self.loader)) if self._max_updates_per_epoch is not None else None
@@ -317,18 +340,89 @@ class BaseTrainer(object):
                     data[key] = data[key].to(self.device)
 
             # apply possible pre-processing to the batch before the forward pass
-            data = self.model.pre_model_hook(data, is_train=True)
+            #data = self.model.pre_model_hook(data, is_train=True)
 
             # get predictions
-            predictions = self.model(data)
+            #predictions = self.model(data)
 
-            if self.noise_sampler_y is not None:
-                for key in filter(lambda k: 'y' in k, data.keys()):
-                    noise = self.noise_sampler_y.sample(data[key].shape)
-                    # make sure we add near-zero noise to originally near-zero targets
-                    data[key] += (data[key] + self._target_mean / self._target_std) * noise.to(self.device)
 
-            loss, all_losses = self.loss_obj(predictions, data)
+            # apply possible pre-processing to the batch before the forward pass
+            # apply possible pre-processing to the batch before the forward pass
+            data = self.model.pre_model_hook(data, is_train=True)
+
+            # --------------------------------------------------
+            # PERSISTENT LSTM: process each sequence in the batch
+            # sequentially, carrying hidden state across sequences
+            # and resetting when the basin changes.
+            # --------------------------------------------------
+            if self.persistent_state and self.cfg.model.lower() == "persistentlstm":
+                x_d_key = None
+                # find the main dynamic-input key, e.g. 'x_d' or 'x_d_<freq>'
+                for k in data.keys():
+                    if k.startswith("x_d") and not k.endswith("_hindcast") and not k.endswith("_forecast"):
+                        x_d_key = k
+                        break
+                if x_d_key is None:
+                    raise RuntimeError("PersistentLSTM expects a key starting with 'x_d' in the batch.")
+
+                batch_size = data[x_d_key][list(data[x_d_key].keys())[0]].shape[0]
+
+                total_loss = 0.0
+                all_losses_accum = None
+
+                # process each sequence in the batch one-by-one
+                # process each sequence in the batch one-by-one
+                for b in range(batch_size):
+                    # ---- build a single-sample view 'sample_b' ----
+                    sample_b = {}
+                    for key, val in data.items():
+                        if key.startswith("date"):
+                            # keep batch dim of size 1
+                            sample_b[key] = val[b:b + 1]
+                        elif key.startswith("x_d"):
+                            # dict of dynamic features
+                            sample_b[key] = {feat: ten[b:b + 1] for feat, ten in val.items()}
+                        else:
+                            # everything else is a tensor
+                            sample_b[key] = val[b:b + 1]
+
+                    # basin_idx must be present (we added it in BaseDataset.__getitem__)
+                    basin_idx = int(sample_b["basin_idx"].item())
+
+                    # new basin → reset hidden state
+                    if self._current_basin_idx is None or basin_idx != self._current_basin_idx:
+                        self._persistent_hidden = None
+                        self._current_basin_idx = basin_idx
+
+                    # forward pass with current persistent hidden state
+                    preds_b = self.model(sample_b, hidden_state=self._persistent_hidden)
+
+                    # update hidden state (detach to cut graph)
+                    new_hidden = preds_b.get("hidden_state", None)
+                    if new_hidden is not None:
+                        h, c = new_hidden
+                        self._persistent_hidden = (h.detach(), c.detach())
+
+                    # compute loss for this sequence
+                    loss_b, all_losses_b = self.loss_obj(preds_b, sample_b)
+
+                    total_loss = total_loss + loss_b
+                    if all_losses_accum is None:
+                        all_losses_accum = {k: v.clone() for k, v in all_losses_b.items()}
+                    else:
+                        for k in all_losses_b:
+                            all_losses_accum[k] += all_losses_b[k]
+
+                # average over sequences in this batch
+                loss = total_loss / batch_size
+                all_losses = {k: v / batch_size for k, v in all_losses_accum.items()}
+
+            # --------------------------------------------------
+            # NORMAL BEHAVIOR (all other models)
+            # --------------------------------------------------
+            else:
+                predictions = self.model(data)
+                loss, all_losses = self.loss_obj(predictions, data)
 
             # early stop training if loss is NaN
             if torch.isnan(loss):

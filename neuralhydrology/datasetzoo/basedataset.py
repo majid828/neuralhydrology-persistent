@@ -97,6 +97,9 @@ class BaseDataset(Dataset):
             self.basins = utils.load_basin_file(getattr(cfg, f"{period}_basin_file"))
         else:
             self.basins = [basin]
+        # Map basin id -> integer index (used for persistent LSTM state resets)
+        self._basin_to_idx = {b: i for i, b in enumerate(self.basins)}
+
         self.additional_features = additional_features
         self.id_to_int = id_to_int
         self.scaler = scaler
@@ -111,6 +114,12 @@ class BaseDataset(Dataset):
         self.seq_len = None
         self._predict_last_n = None
         self._initialize_frequency_configuration()
+        # ------------------------------------------------------------------
+        # Persistent / subsampling options (e.g. for persistent LSTM)
+        # Defaults keep the original behavior: use every valid sample (stride=1)
+        # ------------------------------------------------------------------
+        self.seq_stride = getattr(cfg, "seq_stride", 1)
+        self.non_overlapping_sequences = getattr(cfg, "non_overlapping_sequences", False)
 
         # during training we log data processing with progress bars, but not during validation/testing
         self._disable_pbar = cfg.verbose == 0 or not self.is_train
@@ -151,6 +160,9 @@ class BaseDataset(Dataset):
         basin, indices = self.lookup_table[item]
 
         sample = {}
+        # Integer basin index so the trainer can reset state per basin (persistent LSTM)
+        sample["basin_idx"] = torch.tensor(self._basin_to_idx[basin], dtype=torch.long)
+
         for freq, seq_len, idx in zip(self.frequencies, self.seq_len, indices):
             # if there's just one frequency, don't use suffixes.
             freq_suffix = '' if len(self.frequencies) == 1 else f'_{freq}'
@@ -640,10 +652,39 @@ class BaseDataset(Dataset):
                 x_d[self.frequencies[0]].update({col: df_resampled[[col]].values
                                                  for col in self.cfg.autoregressive_inputs})
 
-            valid_samples = np.argwhere(flag == 1)
+            # indices (in lowest-frequency steps) where the sample is valid
+            valid_samples = np.argwhere(flag == 1).flatten()
+
+            # --------------------------------------------------------------
+            # Optional thinning / non-overlapping sampling
+            # For persistent LSTM (single frequency) we typically want stride
+            # >= seq_len[0] so that windows do not overlap in time.
+            # --------------------------------------------------------------
+            if self.non_overlapping_sequences:
+                if len(self.frequencies) != 1:
+                    raise ValueError(
+                        "non_overlapping_sequences is currently only supported for single-frequency datasets.")
+                stride = int(self.seq_stride)
+                if stride <= 0:
+                    raise ValueError("seq_stride must be a positive integer.")
+                # If user left seq_stride=1, default to full sequence length for non-overlapping windows
+                if stride == 1:
+                    stride = int(self.seq_len[0])
+                valid_samples = valid_samples[::stride]
+            elif self.seq_stride > 1:
+                stride = int(self.seq_stride)
+                if stride <= 0:
+                    raise ValueError("seq_stride must be a positive integer.")
+                valid_samples = valid_samples[::stride]
+
+            # store pointer to basin and the sample's index in each frequency
             for f in valid_samples:
-                # store pointer to basin and the sample's index in each frequency
                 lookup.append((basin, [frequency_maps[freq][int(f)] for freq in self.frequencies]))
+
+            #valid_samples = np.argwhere(flag == 1)
+            #for f in valid_samples:
+                # store pointer to basin and the sample's index in each frequency
+               # lookup.append((basin, [frequency_maps[freq][int(f)] for freq in self.frequencies]))
 
             # only store data if this basin has at least one valid sample in the given period
             if valid_samples.size > 0:

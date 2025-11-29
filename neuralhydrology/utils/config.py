@@ -764,6 +764,30 @@ class Config(object):
     def seq_length(self) -> Union[int, Dict[str, int]]:
         return self._get_value_verbose("seq_length")
 
+    # ------------------------------------------------------------------
+    # Persistent LSTM / sampling options
+    # ------------------------------------------------------------------
+    @property
+    def persistent_state(self) -> bool:
+        """Enable special hidden-state handling for persistent LSTM."""
+        return self._cfg.get("persistent_state", False)
+
+    @property
+    def non_overlapping_sequences(self) -> bool:
+        """
+        If True, BaseDataset will subsample valid samples so that sequences
+        do not overlap in time (used for persistent LSTM).
+        """
+        return self._cfg.get("non_overlapping_sequences", False)
+
+    @property
+    def seq_stride(self) -> int:
+        """
+        Step size (in lowest-frequency samples) between training sequences.
+        Default 1 = use every valid sample, which reproduces original NH behavior.
+        """
+        return self._cfg.get("seq_stride", 1)
+
     @property
     def shared_mtslstm(self) -> bool:
         return self._cfg.get("shared_mtslstm", False)

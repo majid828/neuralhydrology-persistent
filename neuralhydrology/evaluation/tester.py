@@ -284,61 +284,140 @@ class BaseTester(object):
                 results[basin][freq]['xr'] = xr
 
                 # create datetime range at the current frequency
-                freq_date_range = pd.date_range(start=dates[lowest_freq][0, -1], end=dates[freq][-1, -1], freq=freq)
-                # remove datetime steps that are not being predicted from the datetime range
-                mask = np.ones(frequency_factor).astype(bool)
-                mask[:-predict_last_n[freq]] = False
-                freq_date_range = freq_date_range[np.tile(mask, len(xr['date']))]
+                # ------------------------------------------------------------------
+                # Special handling for Persistent LSTM (single-frequency, persistent_state=True)
+                # ------------------------------------------------------------------
+                is_persistent = (
+                        getattr(self.cfg, "persistent_state", False)
+                        and self.cfg.model.lower() == "persistentlstm"
+                        and len(ds.frequencies) == 1
+                )
 
-                # only warn once per freq
-                if frequency_factor < predict_last_n[freq] and basin == basins[0]:
-                    tqdm.write(f'Metrics for {freq} are calculated over last {frequency_factor} elements only. '
-                               f'Ignoring {predict_last_n[freq] - frequency_factor} predictions per sequence.')
+                if is_persistent:
+                    # For Persistent LSTM we want to use **all predict_last_n steps**
+                    # in each sequence, not just the last `frequency_factor` steps.
+                    if basin == basins[0]:
+                        tqdm.write(
+                            f"PersistentLSTM: metrics for {freq} use all "
+                            f"{predict_last_n[freq]} time steps per sequence."
+                        )
 
-                if metrics:
-                    for target_variable in self.cfg.target_variables:
-                        # stack dates and time_steps so we don't just evaluate every 24h when use_frequencies=[1D, 1h]
-                        obs = xr.isel(time_step=slice(-frequency_factor, None)) \
-                            .stack(datetime=['date', 'time_step']) \
-                            .drop_vars({'datetime', 'date', 'time_step'})[f"{target_variable}_obs"]
-                        obs['datetime'] = freq_date_range
-                        # check if there are observations for this period
-                        if not all(obs.isnull()):
-                            sim = xr.isel(time_step=slice(-frequency_factor, None)) \
-                                .stack(datetime=['date', 'time_step']) \
-                                .drop_vars({'datetime', 'date', 'time_step'})[f"{target_variable}_sim"]
-                            sim['datetime'] = freq_date_range
+                    if metrics:
+                        for target_variable in self.cfg.target_variables:
+                            # Flatten (date, time_step) into a single time axis
+                            obs = xr[f"{target_variable}_obs"].stack(datetime=["date", "time_step"])
+                            sim = xr[f"{target_variable}_sim"].stack(datetime=["date", "time_step"])
 
-                            # clip negative predictions to zero, if variable is listed in config 'clip_target_to_zero'
+                            # Drop NaN observations and align simulations accordingly
+                            valid_mask = ~np.isnan(obs)
+                            obs = obs[valid_mask]
+                            sim = sim[valid_mask]
+
+                            # clip negative predictions to zero, if needed
                             if target_variable in self.cfg.clip_targets_to_zero:
                                 sim = xarray.where(sim < 0, 0, sim)
 
-                            if 'samples' in sim.dims:
-                                sim = sim.mean(dim='samples')
+                            if "samples" in sim.dims:
+                                sim = sim.mean(dim="samples")
 
                             var_metrics = metrics if isinstance(metrics, list) else metrics[target_variable]
-                            if 'all' in var_metrics:
+                            if "all" in var_metrics:
                                 var_metrics = get_available_metrics()
+
                             try:
                                 values = calculate_metrics(obs, sim, metrics=var_metrics, resolution=freq)
                             except AllNaNError as err:
-                                msg = f'Basin {basin} ' \
-                                    + (f'{target_variable} ' if len(self.cfg.target_variables) > 1 else '') \
-                                    + (f'{freq} ' if len(ds.frequencies) > 1 else '') \
-                                    + str(err)
+                                msg = (
+                                        f"Basin {basin} "
+                                        + (f"{target_variable} " if len(self.cfg.target_variables) > 1 else "")
+                                        + str(err)
+                                )
                                 LOGGER.warning(msg)
                                 values = {metric: np.nan for metric in var_metrics}
 
-                            # add variable identifier to metrics if needed
+                            # add variable identifier if multiple targets
                             if len(self.cfg.target_variables) > 1:
                                 values = {f"{target_variable}_{key}": val for key, val in values.items()}
-                            # add frequency identifier to metrics if needed
+
+                            # (single-frequency persistent → no freq suffix needed, but keep pattern)
                             if len(ds.frequencies) > 1:
                                 values = {f"{key}_{freq}": val for key, val in values.items()}
+
                             if experiment_logger is not None:
                                 experiment_logger.log_step(**values)
                             for k, v in values.items():
                                 results[basin][freq][k] = v
+
+                else:
+                    # ------------------------------------------------------------------
+                    # ORIGINAL behaviour (unchanged) for ALL OTHER MODELS
+                    # ------------------------------------------------------------------
+                    # create datetime range at the current frequency
+                    freq_date_range = pd.date_range(
+                        start=dates[lowest_freq][0, -1], end=dates[freq][-1, -1], freq=freq
+                    )
+                    # remove datetime steps that are not being predicted from the datetime range
+                    mask = np.ones(frequency_factor).astype(bool)
+                    mask[:-predict_last_n[freq]] = False
+                    freq_date_range = freq_date_range[np.tile(mask, len(xr["date"]))]
+
+                    # only warn once per freq
+                    if frequency_factor < predict_last_n[freq] and basin == basins[0]:
+                        tqdm.write(
+                            f"Metrics for {freq} are calculated over last {frequency_factor} elements only. "
+                            f"Ignoring {predict_last_n[freq] - frequency_factor} predictions per sequence."
+                        )
+
+                    if metrics:
+                        for target_variable in self.cfg.target_variables:
+                            # stack dates and time_steps so we don't just evaluate every 24h when use_frequencies=[1D, 1h]
+                            obs = (
+                                xr.isel(time_step=slice(-frequency_factor, None))
+                                .stack(datetime=["date", "time_step"])
+                                .drop_vars({"datetime", "date", "time_step"})[f"{target_variable}_obs"]
+                            )
+                            obs["datetime"] = freq_date_range
+                            # check if there are observations for this period
+                            if not all(obs.isnull()):
+                                sim = (
+                                    xr.isel(time_step=slice(-frequency_factor, None))
+                                    .stack(datetime=["date", "time_step"])
+                                    .drop_vars({"datetime", "date", "time_step"})[f"{target_variable}_sim"]
+                                )
+                                sim["datetime"] = freq_date_range
+
+                                # clip negative predictions to zero, if variable is listed in config 'clip_target_to_zero'
+                                if target_variable in self.cfg.clip_targets_to_zero:
+                                    sim = xarray.where(sim < 0, 0, sim)
+
+                                if "samples" in sim.dims:
+                                    sim = sim.mean(dim="samples")
+
+                                var_metrics = metrics if isinstance(metrics, list) else metrics[target_variable]
+                                if "all" in var_metrics:
+                                    var_metrics = get_available_metrics()
+                                try:
+                                    values = calculate_metrics(obs, sim, metrics=var_metrics, resolution=freq)
+                                except AllNaNError as err:
+                                    msg = (
+                                            f"Basin {basin} "
+                                            + (f"{target_variable} " if len(self.cfg.target_variables) > 1 else "")
+                                            + (f"{freq} " if len(ds.frequencies) > 1 else "")
+                                            + str(err)
+                                    )
+                                    LOGGER.warning(msg)
+                                    values = {metric: np.nan for metric in var_metrics}
+
+                                # add variable identifier to metrics if needed
+                                if len(self.cfg.target_variables) > 1:
+                                    values = {f"{target_variable}_{key}": val for key, val in values.items()}
+                                # add frequency identifier to metrics if needed
+                                if len(ds.frequencies) > 1:
+                                    values = {f"{key}_{freq}": val for key, val in values.items()}
+                                if experiment_logger is not None:
+                                    experiment_logger.log_step(**values)
+                                for k, v in values.items():
+                                    results[basin][freq][k] = v
 
         # convert default dict back to normal Python dict to avoid unexpected behavior when trying to access
         # a non-existing basin
