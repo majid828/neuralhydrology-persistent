@@ -93,6 +93,58 @@ class BaseTrainer(object):
         self._set_random_seeds()
         self._set_device()
 
+    # ------------------------------------------------------------------
+    # Helper methods for persistent LSTM reshaping and segment slicing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _flatten_time_batch(t: torch.Tensor) -> torch.Tensor:
+        """Flatten [B, L, ...] → [1, B*L, ...] along the first two dims.
+
+        
+        This helper used to be defined inside the training loop in `_train_epoch`,
+        which redefined the function for every batch. It is now moved out as a
+        static method to avoid that bad practice and to keep the code efficient.
+        """
+        if t.dim() < 2:
+            # Nothing to flatten, return as-is
+            return t
+        b, l = t.shape[0], t.shape[1]
+        remaining = t.shape[2:]  # can be empty, or (F,), (F1, F2), ...
+        new_shape = (1, b * l) + remaining
+        return t.reshape(*new_shape)
+
+    def _slice_time_segment(self, data_dict: Dict[str, object], segment_slice: slice) -> Dict[str, object]:
+        """Slice a contiguous time segment from reshaped data.
+
+        Expects time-like tensors to have shape [1, L_new, ...] after `_flatten_time_batch`.
+        Static (x_s) and non-tensor entries are kept as-is.
+        """
+        seg = {}
+        for key, val in data_dict.items():
+            if key.startswith("x_d"):
+                # Dynamic inputs: dict of feature tensors
+                seg[key] = {feat: v[:, segment_slice, ...] for feat, v in val.items()}
+            elif key.startswith("x_s"):
+                # Static features: do not depend on time
+                seg[key] = val
+            elif key.startswith("y") or key.startswith("basin_idx"):
+                if torch.is_tensor(val):
+                    if val.dim() == 1:
+                        # 1D case: just slice directly
+                        seg[key] = val[segment_slice]
+                    else:
+                        # 2D+ case: [1, L_new, ...]
+                        seg[key] = val[:, segment_slice, ...]
+                else:
+                    seg[key] = val
+            elif torch.is_tensor(val) and val.dim() >= 2:
+                seg[key] = val[:, segment_slice, ...]
+            else:
+                # Non-tensor (e.g., dates, lists, strings) or scalars: keep as-is
+                seg[key] = val
+        return seg
+
     def _get_dataset(self) -> BaseDataset:
         return get_dataset(cfg=self.cfg, period="train", is_train=True, scaler=self._scaler)
 
@@ -353,41 +405,20 @@ class BaseTrainer(object):
 
             # --------------------------------------------------
             # PERSISTENT LSTM: reshape [B, L, F] -> [1, B*L, F]
-            # and process the whole batch as one long sequence.
-            # Persistent hidden state is carried across batches.
+            # and process the batch as basin-consistent segments.
+            # Persistent hidden state is carried across batches,
+            # but NOT across different basins.
             # --------------------------------------------------
             if self.persistent_state and self.cfg.model.lower() == "persistentlstm":
 
-                # Helper: flatten the first two dimensions (B, L) into one time dimension
-                # Example: [B, L, F] -> [1, B*L, F]
-                def _flatten_time_batch(t: torch.Tensor) -> torch.Tensor:
-                    if t.dim() < 2:
-                        # Nothing to flatten, return as-is
-                        return t
-                    b, l = t.shape[0], t.shape[1]
-                    remaining = t.shape[2:]  # can be empty, or (F,), (F1, F2), ...
-                    new_shape = (1, b * l) + remaining
-                    return t.view(*new_shape)
-
-                # ----- Step 1: Inter-batch reset based on first basin in this batch -----
-                # basin_idx can be of shape [B], [B, 1], or [B, L].
-                basin_idx_batch = data["basin_idx"]
-                basin_idx_flat = basin_idx_batch.view(-1)
-                basin_idx_start = int(basin_idx_flat[0].item())
-
-                # If this batch starts with a new basin (different from the previous batch),
-                # we reset the persistent hidden state.
-                if self._current_basin_idx is None or basin_idx_start != self._current_basin_idx:
-                    self._persistent_hidden = None
-
-                # ----- Step 2: Build reshaped_data with flattened time dimension -----
+                # ----- Step 1: Build reshaped_data with flattened time dimension -----
                 reshaped_data: Dict[str, object] = {}
 
                 for key, val in data.items():
                     if key.startswith("x_d"):
                         # Dynamic inputs: dict of feature tensors
                         # Each v is [B, L, F_feat] (or similar) -> [1, B*L, F_feat]
-                        reshaped_data[key] = {feat: _flatten_time_batch(v) for feat, v in val.items()}
+                        reshaped_data[key] = {feat: self._flatten_time_batch(v) for feat, v in val.items()}
 
                     elif key.startswith("x_s"):
                         # Static features do not depend on time; keep them as they are.
@@ -395,52 +426,142 @@ class BaseTrainer(object):
 
                     elif key.startswith("y"):
                         # Targets: [B, L, n_targets] -> [1, B*L, n_targets]
-                        reshaped_data[key] = _flatten_time_batch(val)
+                        reshaped_data[key] = self._flatten_time_batch(val)
 
                     elif key.startswith("basin_idx"):
-                        # Basin indices: we need them along the sequence so that
-                        # the model can detect basin changes inside the long sequence.
-                        # [B, L] or [B] -> [1, B*L]
-                        reshaped_data[key] = _flatten_time_batch(val)
+                        # Basin indices: we need them aligned with time [B, L]
+                        # so that after flattening we get [1, B*L].
+                        if torch.is_tensor(val) and val.dim() == 1:
+                            # Shape [B]; expand to [B, L] using any x_d to infer L
+                            L_inferred = None
+                            for dk, dv in data.items():
+                                if dk.startswith("x_d"):
+                                    any_feat = next(iter(dv.values()))
+                                    # expect [B, L, ...]
+                                    L_inferred = any_feat.shape[1]
+                                    break
+                            if L_inferred is None:
+                                raise RuntimeError("Could not infer sequence length L to expand basin_idx.")
+
+                            B = val.shape[0]
+                            basin_2d = val.view(B, 1).expand(B, L_inferred)
+                            reshaped_data[key] = self._flatten_time_batch(basin_2d)
+                        else:
+                            # If already [B, L] or higher-dim, just flatten normally
+                            reshaped_data[key] = self._flatten_time_batch(val)
 
                     else:
                         # Other keys: dates, masks, etc.
                         if torch.is_tensor(val):
                             # If it looks like time-series (>=2 dims), flatten B and L.
                             if val.dim() >= 2:
-                                reshaped_data[key] = _flatten_time_batch(val)
+                                reshaped_data[key] = self._flatten_time_batch(val)
                             else:
-                                # 1D tensors: [B*L] -> [1, B*L]
+                                # 1D tensors: [N] -> [1, N]
                                 reshaped_data[key] = val.view(1, -1) if val.dim() == 1 else val
                         else:
                             # Non-tensor (e.g. strings, lists) -> keep as-is
                             reshaped_data[key] = val
 
-                # ----- Step 3: Forward pass on the whole long sequence -----
-                # The model receives the long sequence [1, B*L, F] and the
-                # persistent hidden state from the previous batch (if any).
-                predictions = self.model(reshaped_data, hidden_state=self._persistent_hidden)
+                # ----- Step 2: Split the flattened sequence into basin segments -----
+                # Previously, the hidden state was only reset when the FIRST basin of a batch
+                # changed relative to the previous batch. If multiple basins occurred inside
+                # a single batch, the hidden state could leak from one basin into another.
+                # Here we address that by:
+                # - Flattening basin_idx to [L_new]
+                # - Finding change points where basin_idx changes
+                # - Splitting the long sequence into contiguous basin-homogeneous segments
+                # - Running the model on each segment separately and resetting hidden
+                #   whenever the basin changes (within or across batches).
+                basin_indices_flat = reshaped_data["basin_idx"].view(-1)
+                L_new = basin_indices_flat.size(0)
+
+                if L_new == 0:
+                    # Degenerate case: nothing to train on in this batch
+                    continue
+
+                # Find indices where basin changes between consecutive time steps
+                diff = basin_indices_flat[1:] - basin_indices_flat[:-1]
+                change_points = torch.where(diff != 0)[0] + 1  # +1 to get slice boundaries
+
+                # Build list of slices for segments of constant basin_idx
+                segment_slices = []
+                start = 0
+                for cp in change_points:
+                    cp_int = int(cp.item())
+                    segment_slices.append(slice(start, cp_int))
+                    start = cp_int
+                # Last segment
+                segment_slices.append(slice(start, L_new))
+
+                # ----- Step 3: Loop over segments, manage hidden state, accumulate loss -----
+                total_loss = None
+                total_len = 0
+                accumulated_losses = None
+
+                hidden = self._persistent_hidden
+                prev_basin_id = None
+
+                for i_seg, segment_slice in enumerate(segment_slices):
+                    seg_data = self._slice_time_segment(reshaped_data, segment_slice)
+
+                    # Basin id for this whole segment (all equal by construction)
+                    seg_basin_ids = seg_data["basin_idx"].view(-1)
+                    basin_id_this_seg = int(seg_basin_ids[0].item())
+
+                    # Inter-batch and intra-batch reset logic:
+                    # - For the first segment, compare with _current_basin_idx (previous batch)
+                    # - For later segments, reset when basin changes relative to previous segment
+                    if i_seg == 0:
+                        if self._current_basin_idx is None or basin_id_this_seg != self._current_basin_idx:
+                            hidden = None
+                    else:
+                        if prev_basin_id is not None and basin_id_this_seg != prev_basin_id:
+                            hidden = None
+
+                    # Forward pass on this segment
+                    preds = self.model(seg_data, hidden_state=hidden)
+
+                    # Extract and detach new hidden (if provided)
+                    new_hidden = preds.get("hidden_state", None)
+                    if new_hidden is not None:
+                        h, c = new_hidden
+                        hidden = (h.detach(), c.detach())
+                    else:
+                        hidden = None
+
+                    # Segment loss and per-component losses
+                    seg_loss, seg_all_losses = self.loss_obj(preds, seg_data)
+
+                    seg_len = seg_basin_ids.numel()
+
+                    # Weighted accumulation by segment length to obtain global average
+                    if total_loss is None:
+                        total_loss = seg_loss * seg_len
+                    else:
+                        total_loss = total_loss + seg_loss * seg_len
+                    total_len += seg_len
+
+                    if accumulated_losses is None:
+                        accumulated_losses = {k: v * seg_len for k, v in seg_all_losses.items()}
+                    else:
+                        for k, v in seg_all_losses.items():
+                            if k in accumulated_losses:
+                                accumulated_losses[k] = accumulated_losses[k] + v * seg_len
+                            else:
+                                # Just in case new keys appear, handle gracefully
+                                accumulated_losses[k] = v * seg_len
+
+                    prev_basin_id = basin_id_this_seg
+
+                # Final loss averaged over all time steps in this batch
+                loss = total_loss / total_len
+                all_losses = {k: v / total_len for k, v in accumulated_losses.items()}
 
                 # ----- Step 4: Update persistent hidden state and current basin -----
-                # The model is expected to return {"hidden_state": (h, c), ...}
-                new_hidden = predictions.get("hidden_state", None)
-                if new_hidden is not None:
-                    h, c = new_hidden
-                    # Detach so that backprop graph does not cross batch boundaries
-                    self._persistent_hidden = (h.detach(), c.detach())
-
-                    # Update _current_basin_idx to the last basin in this long sequence.
-                    basin_indices_seq = reshaped_data["basin_idx"].view(-1)
-                    self._current_basin_idx = int(basin_indices_seq[-1].item())
-                else:
-                    # If for some reason the model does not return a hidden state,
-                    # we fall back to no persistence for the next batch.
-                    self._persistent_hidden = None
-                    self._current_basin_idx = None
-
-                # ----- Step 5: Compute loss on the reshaped batch -----
-                # Note: targets 'y' were reshaped, so we must pass reshaped_data.
-                loss, all_losses = self.loss_obj(predictions, reshaped_data)
+                # We keep the hidden state of the *last* segment and its basin id
+                self._persistent_hidden = hidden
+                self._current_basin_idx = prev_basin_id
 
             # --------------------------------------------------
             # NORMAL BEHAVIOR (all other models)
