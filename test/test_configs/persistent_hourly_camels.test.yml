@@ -8,7 +8,7 @@ validation_basin_file: ./test/test_data/4_basins_test_set.txt
 test_basin_file: ./test/test_data/4_basins_test_set.txt
 
 train_start_date: '01/01/2000'
-train_end_date: '31/12/2001'
+train_end_date: '31/12/2002'
 validation_start_date: '01/01/2001'
 validation_end_date: '31/12/2002'
 test_start_date: '01/01/2001'
@@ -52,8 +52,8 @@ epochs: 15                          # keep small for now while debugging
 clip_gradient_norm: 1
 
 # use ALL timesteps in each sequence for the loss
-seq_length: 24                    # like your standalone code
-predict_last_n: 24                # must equal seq_length
+seq_length: 2                    # like your standalone code
+predict_last_n: 2                # must equal seq_length
 
 num_workers: 0
 log_interval: 5
@@ -79,4 +79,4 @@ static_attributes:
 # --- Persistent sampling configuration ------------------------------------------------------------
 # Non-overlapping windows for persistent LSTM
 non_overlapping_sequences: true    # <--- NEW
-seq_stride: 24                  # <--- NEW (usually = seq_length)
+seq_stride: 2                  # <--- NEW (usually = seq_length)
