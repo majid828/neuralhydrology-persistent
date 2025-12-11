@@ -16,7 +16,12 @@ from tqdm import tqdm
 
 from neuralhydrology.datasetzoo import get_dataset
 from neuralhydrology.datasetzoo.basedataset import BaseDataset
-from neuralhydrology.datautils.utils import get_frequency_factor, load_basin_file, load_scaler, sort_frequencies
+from neuralhydrology.datautils.utils import (
+    get_frequency_factor,
+    load_basin_file,
+    load_scaler,
+    sort_frequencies,
+)
 from neuralhydrology.evaluation import plots
 from neuralhydrology.evaluation.metrics import calculate_metrics, get_available_metrics
 from neuralhydrology.evaluation.utils import load_basin_id_encoding, metrics_to_dataframe
@@ -83,7 +88,7 @@ class BaseTester(object):
     def _set_device(self):
         if self.cfg.device is not None:
             if self.cfg.device.startswith("cuda"):
-                gpu_id = int(self.cfg.device.split(':')[-1])
+                gpu_id = int(self.cfg.device.split(":")[-1])
                 if gpu_id > torch.cuda.device_count():
                     raise RuntimeError(f"This machine does not have GPU #{gpu_id} ")
                 else:
@@ -129,7 +134,7 @@ class BaseTester(object):
     def _get_weight_file(self, epoch: int):
         """Get file path to weight file"""
         if epoch is None:
-            weight_file = sorted(list(self.run_dir.glob('model_epoch*.pt')))[-1]
+            weight_file = sorted(list(self.run_dir.glob("model_epoch*.pt")))[-1]
         else:
             weight_file = self.run_dir / f"model_epoch{str(epoch).zfill(3)}.pt"
 
@@ -144,24 +149,28 @@ class BaseTester(object):
 
     def _get_dataset(self, basin: str) -> BaseDataset:
         """Get dataset for a single basin."""
-        ds = get_dataset(cfg=self.cfg,
-                         is_train=False,
-                         period=self.period,
-                         basin=basin,
-                         additional_features=self.additional_features,
-                         id_to_int=self.id_to_int,
-                         scaler=self.scaler)
+        ds = get_dataset(
+            cfg=self.cfg,
+            is_train=False,
+            period=self.period,
+            basin=basin,
+            additional_features=self.additional_features,
+            id_to_int=self.id_to_int,
+            scaler=self.scaler,
+        )
         return ds
 
-    def evaluate(self,
-                 epoch: int = None,
-                 save_results: bool = True,
-                 save_all_output: bool = False,
-                 metrics: Union[list, dict] = [],
-                 model: torch.nn.Module = None,
-                 experiment_logger: Logger = None) -> dict:
+    def evaluate(
+        self,
+        epoch: int = None,
+        save_results: bool = True,
+        save_all_output: bool = False,
+        metrics: Union[list, dict] = [],
+        model: torch.nn.Module = None,
+        experiment_logger: Logger = None,
+    ) -> dict:
         """Evaluate the model.
-        
+
         Parameters
         ----------
         epoch : int, optional
@@ -194,7 +203,7 @@ class BaseTester(object):
         if self.period == "validation":
             if len(basins) > self.cfg.validate_n_random_basins:
                 random.shuffle(basins)
-                basins = basins[:self.cfg.validate_n_random_basins]
+                basins = basins[: self.cfg.validate_n_random_basins]
 
         # force model to train-mode when doing mc-dropout evaluation
         if self.cfg.mc_dropout:
@@ -206,7 +215,7 @@ class BaseTester(object):
         all_output = {basin: None for basin in basins}
 
         pbar = tqdm(basins, file=sys.stdout, disable=self._disable_pbar)
-        pbar.set_description('# Validation' if self.period == "validation" else "# Evaluation")
+        pbar.set_description("# Validation" if self.period == "validation" else "# Evaluation")
 
         for basin in pbar:
 
@@ -215,16 +224,23 @@ class BaseTester(object):
             else:
                 try:
                     ds = self._get_dataset(basin)
-                except NoEvaluationDataError as error:
+                except NoEvaluationDataError:
                     # skip basin
                     continue
                 if self.cfg.cache_validation_data and self.period == "validation":
                     self.cached_datasets[basin] = ds
 
-            loader = DataLoader(ds, batch_size=self.cfg.batch_size, num_workers=0, collate_fn=ds.collate_fn)
+            loader = DataLoader(
+                ds,
+                batch_size=self.cfg.batch_size,
+                num_workers=0,
+                collate_fn=ds.collate_fn,
+            )
 
-            y_hat, y, dates, all_losses, all_output[basin] = self._evaluate(model, loader, ds.frequencies,
-                                                                            save_all_output)
+            # --- evaluation (persistent or normal) ---
+            y_hat, y, dates, all_losses, all_output[basin] = self._evaluate(
+                model, loader, ds.frequencies, save_all_output
+            )
 
             # log loss of this basin plus number of samples in the logger to compute epoch aggregates later
             if experiment_logger is not None:
@@ -256,7 +272,9 @@ class BaseTester(object):
                     feature_center = np.expand_dims(feature_center, (0, 1, 3))
                     y_hat_freq = y_hat[freq] * feature_scaler + feature_center
                 else:
-                    raise RuntimeError(f"Simulations have {y_hat[freq].ndim} dimension. Only 3 and 4 are supported.")
+                    raise RuntimeError(
+                        f"Simulations have {y_hat[freq].ndim} dimension. Only 3 and 4 are supported."
+                    )
 
                 # Create data_vars dictionary for the xarray.Dataset
                 data_vars = self._create_xarray_data_vars(y_hat_freq, y_freq)
@@ -270,32 +288,35 @@ class BaseTester(object):
                 # computing the timedelta of the dates. To account for predict_last_n > 1 and multi-freq stuff, we
                 # need to add the frequency factor and remove 1 (to start at zero).
                 coords = {
-                    'date':
-                        dates[lowest_freq][:, -1],
-                    'time_step': ((dates[freq][0, :] - dates[freq][0, -1]) / pd.Timedelta(freq)).astype(np.int64) +
-                                 frequency_factor - 1
+                    "date": dates[lowest_freq][:, -1],
+                    "time_step": (
+                        (dates[freq][0, :] - dates[freq][0, -1]) / pd.Timedelta(freq)
+                    ).astype(np.int64)
+                    + frequency_factor
+                    - 1,
                 }
                 xr = xarray.Dataset(data_vars=data_vars, coords=coords)
-                xr = xr.reindex({
-                    'date':
-                        pd.DatetimeIndex(pd.date_range(xr["date"].values[0], xr["date"].values[-1], freq=lowest_freq),
-                                         name='date')
-                })
-                results[basin][freq]['xr'] = xr
+                xr = xr.reindex(
+                    {
+                        "date": pd.DatetimeIndex(
+                            pd.date_range(xr["date"].values[0], xr["date"].values[-1], freq=lowest_freq),
+                            name="date",
+                        )
+                    }
+                )
+                results[basin][freq]["xr"] = xr
 
-                # create datetime range at the current frequency
                 # ------------------------------------------------------------------
                 # Special handling for Persistent LSTM (single-frequency, persistent_state=True)
                 # ------------------------------------------------------------------
                 is_persistent = (
-                        getattr(self.cfg, "persistent_state", False)
-                        and self.cfg.model.lower() == "persistentlstm"
-                        and len(ds.frequencies) == 1
+                    getattr(self.cfg, "persistent_state", False)
+                    and self.cfg.model.lower() == "persistentlstm"
+                    and len(ds.frequencies) == 1
                 )
 
                 if is_persistent:
-                    # For Persistent LSTM we want to use **all predict_last_n steps**
-                    # in each sequence, not just the last `frequency_factor` steps.
+                    # For Persistent LSTM we use ALL predict_last_n steps per sequence.
                     if basin == basins[0]:
                         tqdm.write(
                             f"PersistentLSTM: metrics for {freq} use all "
@@ -328,9 +349,9 @@ class BaseTester(object):
                                 values = calculate_metrics(obs, sim, metrics=var_metrics, resolution=freq)
                             except AllNaNError as err:
                                 msg = (
-                                        f"Basin {basin} "
-                                        + (f"{target_variable} " if len(self.cfg.target_variables) > 1 else "")
-                                        + str(err)
+                                    f"Basin {basin} "
+                                    + (f"{target_variable} " if len(self.cfg.target_variables) > 1 else "")
+                                    + str(err)
                                 )
                                 LOGGER.warning(msg)
                                 values = {metric: np.nan for metric in var_metrics}
@@ -400,10 +421,10 @@ class BaseTester(object):
                                     values = calculate_metrics(obs, sim, metrics=var_metrics, resolution=freq)
                                 except AllNaNError as err:
                                     msg = (
-                                            f"Basin {basin} "
-                                            + (f"{target_variable} " if len(self.cfg.target_variables) > 1 else "")
-                                            + (f"{freq} " if len(ds.frequencies) > 1 else "")
-                                            + str(err)
+                                        f"Basin {basin} "
+                                        + (f"{target_variable} " if len(self.cfg.target_variables) > 1 else "")
+                                        + (f"{freq} " if len(ds.frequencies) > 1 else "")
+                                        + str(err)
                                     )
                                     LOGGER.warning(msg)
                                     values = {metric: np.nan for metric in var_metrics}
@@ -423,8 +444,7 @@ class BaseTester(object):
         # a non-existing basin
         results = dict(results)
 
-        if (self.period == "validation") and (self.cfg.log_n_figures > 0) and (experiment_logger
-                                                                               is not None) and results:
+        if (self.period == "validation") and (self.cfg.log_n_figures > 0) and (experiment_logger is not None) and results:
             self._create_and_log_figures(results, experiment_logger, epoch)
 
         # save model output to file, if requested
@@ -447,7 +467,7 @@ class BaseTester(object):
             for freq in results[basins[0]].keys():
                 figures = []
                 for i in range(max_figures):
-                    xr = results[basins[i]][freq]['xr']
+                    xr = results[basins[i]][freq]["xr"]
                     obs = xr[f"{target_var}_obs"].values
                     sim = xr[f"{target_var}_sim"].values
                     # clip negative predictions to zero, if variable is listed in config 'clip_target_to_zero'
@@ -455,13 +475,21 @@ class BaseTester(object):
                         sim = xarray.where(sim < 0, 0, sim)
                     figures.append(
                         self._get_plots(
-                            obs, sim, title=f"{target_var} - Basin {basins[i]} - Epoch {epoch} - Frequency {freq}")[0])
+                            obs,
+                            sim,
+                            title=f"{target_var} - Basin {basins[i]} - Epoch {epoch} - Frequency {freq}",
+                        )[0]
+                    )
                 # make sure the preamble is a valid file name
-                experiment_logger.log_figures(figures, freq, preamble=re.sub(r"[^A-Za-z0-9\._\-]+", "", target_var))
+                experiment_logger.log_figures(
+                    figures,
+                    freq,
+                    preamble=re.sub(r"[^A-Za-z0-9\._\-]+", "", target_var),
+                )
 
     def _save_results(self, results: Optional[dict], states: Optional[dict] = None, epoch: int = None):
         """Store results in various formats to disk.
-        
+
         Developer note: We cannot store the time series data (the xarray objects) as netCDF file but have to use
         pickle as a wrapper. The reason is that netCDF files have special constraints on the characters/symbols that can
         be used as variable names. However, for convenience we will store metrics, if calculated, in a separate csv-file.
@@ -499,8 +527,29 @@ class BaseTester(object):
                 pickle.dump(states, fp)
             LOGGER.info(f"Stored states at {result_file}")
 
-    def _evaluate(self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False):
-        """Evaluate model"""
+    # ------------------------------------------------------------------
+    # EVALUATION CORE
+    # ------------------------------------------------------------------
+    def _evaluate(
+        self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False
+    ):
+        """Evaluate model.
+
+        For PersistentLSTM with persistent_state=True and a single frequency,
+        this dispatches to `_evaluate_persistent`, which mirrors the training
+        logic (sequence-by-sequence, carrying hidden state).
+        For all other models, the original batch-wise evaluation is used.
+        """
+        is_persistent = (
+            getattr(self.cfg, "persistent_state", False)
+            and self.cfg.model.lower() == "persistentlstm"
+            and len(frequencies) == 1
+        )
+
+        if is_persistent:
+            return self._evaluate_persistent(model, loader, frequencies, save_all_output)
+
+        # ---------------- ORIGINAL (non-persistent) BEHAVIOUR ----------------
         predict_last_n = self.cfg.predict_last_n
         if isinstance(predict_last_n, int):
             predict_last_n = {frequencies[0]: predict_last_n}  # if predict_last_n is int, there's only one frequency
@@ -511,9 +560,9 @@ class BaseTester(object):
             for data in loader:
 
                 for key in data:
-                    if key.startswith('x_d'):
+                    if key.startswith("x_d"):
                         data[key] = {k: v.to(self.device) for k, v in data[key].items()}
-                    elif not key.startswith('date'):
+                    elif not key.startswith("date"):
                         data[key] = data[key].to(self.device)
                 data = model.pre_model_hook(data, is_train=False)
                 predictions, loss = self._get_predictions_and_loss(model, data)
@@ -532,10 +581,10 @@ class BaseTester(object):
                 for freq in frequencies:
                     if predict_last_n[freq] == 0:
                         continue  # no predictions for this frequency
-                    freq_key = '' if len(frequencies) == 1 else f'_{freq}'
+                    freq_key = "" if len(frequencies) == 1 else f"_{freq}"
                     y_hat_sub, y_sub = self._subset_targets(model, data, predictions, predict_last_n[freq], freq_key)
                     # Date subsetting is universal across all models and thus happens here.
-                    date_sub = data[f'date{freq_key}'][:, -predict_last_n[freq]:]
+                    date_sub = data[f"date{freq_key}"][:, -predict_last_n[freq] :]
 
                     if freq not in preds:
                         preds[freq] = y_hat_sub.detach().cpu()
@@ -559,7 +608,7 @@ class BaseTester(object):
         # set to NaN explicitly if all losses are NaN to avoid RuntimeWarning
         mean_losses = {}
         if len(losses) == 0:
-            mean_losses['loss'] = np.nan
+            mean_losses["loss"] = np.nan
         else:
             for loss_name in losses[0].keys():
                 loss_values = [loss[loss_name] for loss in losses]
@@ -567,13 +616,129 @@ class BaseTester(object):
 
         return preds, obs, dates, mean_losses, all_output
 
-    def _get_predictions_and_loss(self, model: BaseModel, data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, float]:
+    def _evaluate_persistent(
+        self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False
+    ):
+        """Persistent evaluation for PersistentLSTM.
+
+        Processes each sequence one-by-one (within each batch) and carries
+        the hidden state across sequences for the entire basin, matching the
+        training behaviour in BaseTrainer.
+        """
+        # single frequency is guaranteed by caller
+        predict_last_n = self.cfg.predict_last_n
+        if isinstance(predict_last_n, int):
+            predict_last_n = {frequencies[0]: predict_last_n}
+
+        preds, obs, dates, all_output = {}, {}, {}, {}
+        losses = []
+
+        persistent_hidden = None  # carried across sequences for this basin
+
+        with torch.no_grad():
+            for data in loader:
+                # move batch to device
+                for key in data:
+                    if key.startswith("x_d"):
+                        data[key] = {k: v.to(self.device) for k, v in data[key].items()}
+                    elif not key.startswith("date"):
+                        data[key] = data[key].to(self.device)
+
+                data = model.pre_model_hook(data, is_train=False)
+
+                # process each sequence in the batch independently, carrying hidden state
+                batch_size = data[list(data.keys())[0]].shape[0]
+
+                for b in range(batch_size):
+                    # ---- build a single-sample view 'sample_b' ----
+                    sample_b: Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]] = {}
+                    for key, val in data.items():
+                        if key.startswith("date"):
+                            sample_b[key] = val[b : b + 1]
+                        elif key.startswith("x_d"):
+                            sample_b[key] = {feat: ten[b : b + 1] for feat, ten in val.items()}
+                        else:
+                            sample_b[key] = val[b : b + 1]
+
+                    # forward pass with current persistent hidden state
+                    predictions_b = model(sample_b, hidden_state=persistent_hidden)
+
+                    # update hidden state (detach graph)
+                    new_hidden = predictions_b.get("hidden_state", None)
+                    if new_hidden is not None:
+                        h, c = new_hidden
+                        persistent_hidden = (h.detach(), c.detach())
+
+                    # compute loss for this sequence
+                    _, all_losses_b = self.loss_obj(predictions_b, sample_b)
+                    losses.append({k: v.item() for k, v in all_losses_b.items()})
+
+                    # save raw outputs if requested
+                    if all_output:
+                        for key, value in predictions_b.items():
+                            if value is not None and type(value) != dict:
+                                all_output[key].append(value.detach().cpu().numpy())
+                    elif save_all_output:
+                        all_output = {
+                            key: [value.detach().cpu().numpy()]
+                            for key, value in predictions_b.items()
+                            if value is not None and type(value) != dict
+                        }
+
+                    # collect predictions/targets/dates per frequency
+                    for freq in frequencies:
+                        if predict_last_n[freq] == 0:
+                            continue
+                        freq_key = "" if len(frequencies) == 1 else f"_{freq}"
+                        y_hat_sub, y_sub = self._subset_targets(
+                            model, sample_b, predictions_b, predict_last_n[freq], freq_key
+                        )
+                        date_sub = sample_b[f"date{freq_key}"][:, -predict_last_n[freq] :]
+
+                        if freq not in preds:
+                            preds[freq] = y_hat_sub.detach().cpu()
+                            obs[freq] = y_sub.cpu()
+                            dates[freq] = date_sub
+                        else:
+                            preds[freq] = torch.cat((preds[freq], y_hat_sub.detach().cpu()), 0)
+                            obs[freq] = torch.cat((obs[freq], y_sub.cpu()), 0)
+                            dates[freq] = np.concatenate((dates[freq], date_sub), axis=0)
+
+        # convert tensors to numpy
+        for freq in preds.keys():
+            preds[freq] = preds[freq].numpy()
+            obs[freq] = obs[freq].numpy()
+
+        # concatenate all output variables
+        for key, list_of_data in all_output.items():
+            all_output[key] = np.concatenate(list_of_data, 0)
+
+        # mean losses
+        mean_losses = {}
+        if len(losses) == 0:
+            mean_losses["loss"] = np.nan
+        else:
+            for loss_name in losses[0].keys():
+                loss_values = [loss[loss_name] for loss in losses]
+                mean_losses[loss_name] = np.nanmean(loss_values) if not np.all(np.isnan(loss_values)) else np.nan
+
+        return preds, obs, dates, mean_losses, all_output
+
+    def _get_predictions_and_loss(
+        self, model: BaseModel, data: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, float]:
         predictions = model(data)
         _, all_losses = self.loss_obj(predictions, data)
         return predictions, {k: v.item() for k, v in all_losses.items()}
 
-    def _subset_targets(self, model: BaseModel, data: Dict[str, torch.Tensor], predictions: np.ndarray,
-                        predict_last_n: int, freq: str):
+    def _subset_targets(
+        self,
+        model: BaseModel,
+        data: Dict[str, torch.Tensor],
+        predictions: np.ndarray,
+        predict_last_n: int,
+        freq: str,
+    ):
         raise NotImplementedError
 
     def _create_xarray_data_vars(self, y_hat: np.ndarray, y: np.ndarray):
@@ -603,17 +768,23 @@ class RegressionTester(BaseTester):
     def __init__(self, cfg: Config, run_dir: Path, period: str = "test", init_model: bool = True):
         super(RegressionTester, self).__init__(cfg, run_dir, period, init_model)
 
-    def _subset_targets(self, model: BaseModel, data: Dict[str, torch.Tensor], predictions: np.ndarray,
-                        predict_last_n: np.ndarray, freq: str):
-        y_hat_sub = predictions[f'y_hat{freq}'][:, -predict_last_n:, :]
-        y_sub = data[f'y{freq}'][:, -predict_last_n:, :]
+    def _subset_targets(
+        self,
+        model: BaseModel,
+        data: Dict[str, torch.Tensor],
+        predictions: np.ndarray,
+        predict_last_n: np.ndarray,
+        freq: str,
+    ):
+        y_hat_sub = predictions[f"y_hat{freq}"][:, -predict_last_n:, :]
+        y_sub = data[f"y{freq}"][:, -predict_last_n:, :]
         return y_hat_sub, y_sub
 
     def _create_xarray_data_vars(self, y_hat: np.ndarray, y: np.ndarray):
         data = {}
         for i, var in enumerate(self.cfg.target_variables):
-            data[f"{var}_obs"] = (('date', 'time_step'), y[:, :, i])
-            data[f"{var}_sim"] = (('date', 'time_step'), y_hat[:, :, i])
+            data[f"{var}_obs"] = (("date", "time_step"), y[:, :, i])
+            data[f"{var}_sim"] = (("date", "time_step"), y_hat[:, :, i])
         return data
 
     def _get_plots(self, qobs: np.ndarray, qsim: np.ndarray, title: str):
@@ -640,28 +811,32 @@ class UncertaintyTester(BaseTester):
     def __init__(self, cfg: Config, run_dir: Path, period: str = "test", init_model: bool = True):
         super(UncertaintyTester, self).__init__(cfg, run_dir, period, init_model)
 
-    def _get_predictions_and_loss(self, model: BaseModel, data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, float]:
+    def _get_predictions_and_loss(
+        self, model: BaseModel, data: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, float]:
         outputs = model(data)
         _, all_losses = self.loss_obj(outputs, data)
         predictions = model.sample(data, self.cfg.n_samples)
         model.eval()
         return predictions, {k: v.item() for k, v in all_losses.items()}
 
-    def _subset_targets(self,
-                        model: BaseModel,
-                        data: Dict[str, torch.Tensor],
-                        predictions: np.ndarray,
-                        predict_last_n: int,
-                        freq: str = None):
-        y_hat_sub = predictions[f'y_hat{freq}'][:, -predict_last_n:, :]
-        y_sub = data[f'y{freq}'][:, -predict_last_n:, :]
+    def _subset_targets(
+        self,
+        model: BaseModel,
+        data: Dict[str, torch.Tensor],
+        predictions: np.ndarray,
+        predict_last_n: int,
+        freq: str = None,
+    ):
+        y_hat_sub = predictions[f"y_hat{freq}"][:, -predict_last_n:, :]
+        y_sub = data[f"y{freq}"][:, -predict_last_n:, :]
         return y_hat_sub, y_sub
 
     def _create_xarray_data_vars(self, y_hat: np.ndarray, y: np.ndarray):
         data = {}
         for i, var in enumerate(self.cfg.target_variables):
-            data[f"{var}_obs"] = (('date', 'time_step'), y[:, :, i])
-            data[f"{var}_sim"] = (('date', 'time_step', 'samples'), y_hat[:, :, i, :])
+            data[f"{var}_obs"] = (("date", "time_step"), y[:, :, i])
+            data[f"{var}_sim"] = (("date", "time_step", "samples"), y_hat[:, :, i, :])
         return data
 
     def _get_plots(self, qobs: np.ndarray, qsim: np.ndarray, title: str):
