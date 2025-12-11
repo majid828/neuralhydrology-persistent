@@ -72,9 +72,9 @@ dynamic_inputs:                    # will be filled by conftest
   - temperature
 target_variables:
   - qobs_mm_per_hour
-static_attributes:
-  - elev_mean
-  - slope_mean
+#static_attributes:  # persistent is not using statistic attributes! so we enable them or disable them it does not effect !! 
+ # - elev_mean
+  #- slope_mean
 
 # --- Persistent sampling configuration ------------------------------------------------------------
 # Non-overlapping windows for persistent LSTM
