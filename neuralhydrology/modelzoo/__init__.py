@@ -18,29 +18,30 @@ from neuralhydrology.modelzoo.odelstm import ODELSTM
 from neuralhydrology.modelzoo.sequential_forecast_lstm import SequentialForecastLSTM
 from neuralhydrology.modelzoo.stacked_forecast_lstm import StackedForecastLSTM
 from neuralhydrology.modelzoo.transformer import Transformer
-from neuralhydrology.utils.config import Config
-
 from neuralhydrology.modelzoo.x_lstm import XLSTM
 from neuralhydrology.modelzoo.persistentlstm import PersistentLSTMModel
+from neuralhydrology.utils.config import Config
 
 
 SINGLE_FREQ_MODELS = [
     "cudalstm",
-    "ealstm", 
-    "customlstm", 
-    "embcudalstm", 
-    "gru", 
+    "ealstm",
+    "customlstm",
+    "embcudalstm",
+    "gru",
     "transformer",
     "mamba",
-    "mclstm", 
+    "mclstm",
     "arlstm",
     "handoff_forecast_lstm",
     "sequential_forecast_lstm",
     "multihead_forecast_lstm",
     "stacked_forecast_lstm",
-    "x_lstm"
+    "x_lstm",
+    "persistentlstm",          # <--- added so persistent LSTM is treated as single-frequency
 ]
-AUTOREGRESSIVE_MODELS = ['arlstm']
+
+AUTOREGRESSIVE_MODELS = ["arlstm"]
 
 
 def get_model(cfg: Config) -> nn.Module:
@@ -65,46 +66,49 @@ def get_model(cfg: Config) -> nn.Module:
     if cfg.model.lower() != "mclstm" and cfg.mass_inputs:
         raise ValueError(f"The use of 'mass_inputs' with {cfg.model} is not supported.")
 
-    if cfg.model.lower() == "arlstm":
+    model_name = cfg.model.lower()
+
+    if model_name == "arlstm":
         model = ARLSTM(cfg=cfg)
-    elif cfg.model.lower() == "x_lstm":
+    elif model_name == "x_lstm":
         model = XLSTM(cfg=cfg)
-    elif cfg.model.lower() == "cudalstm":
+    elif model_name == "cudalstm":
         model = CudaLSTM(cfg=cfg)
-    elif cfg.model.lower() == "ealstm":
+    elif model_name == "ealstm":
         model = EALSTM(cfg=cfg)
-    elif cfg.model.lower() == "customlstm":
+    elif model_name == "customlstm":
         model = CustomLSTM(cfg=cfg)
-    elif cfg.model.lower() == "lstm":
+    elif model_name == "lstm":
         warnings.warn(
-            "The `LSTM` class has been renamed to `CustomLSTM`. Support for `LSTM` will we dropped in the future.",
-            FutureWarning)
+            "The `LSTM` class has been renamed to `CustomLSTM`. Support for `LSTM` will be dropped in the future.",
+            FutureWarning,
+        )
         model = CustomLSTM(cfg=cfg)
-    elif cfg.model.lower() == "gru":
+    elif model_name == "gru":
         model = GRU(cfg=cfg)
-    elif cfg.model.lower() == "embcudalstm":
+    elif model_name == "embcudalstm":
         model = EmbCudaLSTM(cfg=cfg)
-    elif cfg.model.lower() == "mtslstm":
+    elif model_name == "mtslstm":
         model = MTSLSTM(cfg=cfg)
-    elif cfg.model.lower() == "odelstm":
+    elif model_name == "odelstm":
         model = ODELSTM(cfg=cfg)
-    elif cfg.model.lower() == "mclstm":
+    elif model_name == "mclstm":
         model = MCLSTM(cfg=cfg)
-    elif cfg.model.lower() == "transformer":
+    elif model_name == "transformer":
         model = Transformer(cfg=cfg)
-    elif cfg.model.lower() == "mamba":
+    elif model_name == "mamba":
         model = Mamba(cfg=cfg)
-    elif cfg.model.lower() == "handoff_forecast_lstm":
+    elif model_name == "handoff_forecast_lstm":
         model = HandoffForecastLSTM(cfg=cfg)
-    elif cfg.model.lower() == "multihead_forecast_lstm":
+    elif model_name == "multihead_forecast_lstm":
         model = MultiHeadForecastLSTM(cfg=cfg)
-    elif cfg.model.lower() == "sequential_forecast_lstm":
+    elif model_name == "sequential_forecast_lstm":
         model = SequentialForecastLSTM(cfg=cfg)
-    elif cfg.model.lower() == "stacked_forecast_lstm":
+    elif model_name == "stacked_forecast_lstm":
         model = StackedForecastLSTM(cfg=cfg)
-    elif cfg.model.lower() == "hybrid_model":
+    elif model_name == "hybrid_model":
         model = HybridModel(cfg=cfg)
-    elif cfg.model.lower() == "persistentlstm":
+    elif model_name == "persistentlstm":
         model = PersistentLSTMModel(cfg=cfg)
     else:
         raise NotImplementedError(f"{cfg.model} not implemented or not linked in `get_model()`")
