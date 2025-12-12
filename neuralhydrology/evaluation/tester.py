@@ -281,8 +281,13 @@ class BaseTester(object):
 
                     if metrics:
                         for target_variable in self.cfg.target_variables:
-                            obs = xr[f"{target_variable}_obs"].stack(datetime=["date", "time_step"])
-                            sim = xr[f"{target_variable}_sim"].stack(datetime=["date", "time_step"])
+                            frequency_factor = int(get_frequency_factor(lowest_freq, freq))
+                            obs = xr.isel(time_step=slice(-frequency_factor, None)) \
+                                    [f"{target_variable}_obs"].stack(datetime=["date", "time_step"])
+                            sim = xr.isel(time_step=slice(-frequency_factor, None)) \
+                                    [f"{target_variable}_sim"].stack(datetime=["date", "time_step"])
+
+
 
                             valid_mask = ~np.isnan(obs)
                             obs = obs[valid_mask]
