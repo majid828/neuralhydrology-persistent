@@ -28,7 +28,7 @@ metrics:
   - Beta-NSE
 
 # --- Model configuration --------------------------------------------------------------------------
-model: persistentlstm              # <--- use your new model
+model: persistentlstm
 head: regression
 output_activation: linear
 
@@ -37,8 +37,8 @@ initial_forget_bias: 3
 output_dropout: 0.4
 
 # turn on persistent behavior in BaseTrainer
-persistent_state: true             # <--- NEW
-
+persistent_state: true
+nan_handling_method: masked
 # --- Training configuration -----------------------------------------------------------------------
 optimizer: Adam
 loss: MSE
@@ -47,36 +47,30 @@ learning_rate:
   10: 5e-4
   20: 1e-4
 
-batch_size: 64                  # smaller is safer for testing
-epochs: 15                          # keep small for now while debugging
+batch_size: 64
+epochs: 40
 clip_gradient_norm: 1
 
-# use ALL timesteps in each sequence for the loss
-seq_length: 2                    # like your standalone code
-predict_last_n: 2                # must equal seq_length
+seq_length: 2
+predict_last_n: 2
 
 num_workers: 0
 log_interval: 5
-log_tensorboard: False             # can set True later
+log_tensorboard: False
 log_n_figures: 1
 save_weights_every: 1
 save_validation_results: False
 
 # --- Data configurations --------------------------------------------------------------------------
-dataset: hourly_camels_us          # will be filled by conftest
+dataset: hourly_camels_us
 data_dir: ./test/test_data/camels_us
 forcings: nldas_hourly
-# will be filled by conftest
-dynamic_inputs:                    # will be filled by conftest
+dynamic_inputs:
   - total_precipitation
   - temperature
 target_variables:
   - qobs_mm_per_hour
-#static_attributes:  # persistent is not using statistic attributes! so we enable them or disable them it does not effect !! 
- # - elev_mean
-  #- slope_mean
 
 # --- Persistent sampling configuration ------------------------------------------------------------
-# Non-overlapping windows for persistent LSTM
-non_overlapping_sequences: true    # <--- NEW
-seq_stride: 2                  # <--- NEW (usually = seq_length)
+non_overlapping_sequences: true
+seq_stride: 2
