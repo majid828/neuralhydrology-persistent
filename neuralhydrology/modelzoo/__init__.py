@@ -19,7 +19,7 @@ from neuralhydrology.modelzoo.sequential_forecast_lstm import SequentialForecast
 from neuralhydrology.modelzoo.stacked_forecast_lstm import StackedForecastLSTM
 from neuralhydrology.modelzoo.transformer import Transformer
 from neuralhydrology.modelzoo.x_lstm import XLSTM
-from neuralhydrology.modelzoo.persistentlstm import PersistentLSTMModel
+from neuralhydrology.modelzoo.persistentlstm import PersistentLSTMModel    # <--- added so persistent 
 from neuralhydrology.utils.config import Config
 
 
