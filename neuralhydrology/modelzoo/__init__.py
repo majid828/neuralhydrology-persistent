@@ -108,8 +108,8 @@ def get_model(cfg: Config) -> nn.Module:
         model = StackedForecastLSTM(cfg=cfg)
     elif model_name == "hybrid_model":
         model = HybridModel(cfg=cfg)
-    elif model_name == "persistentlstm":
-        model = PersistentLSTMModel(cfg=cfg)
+    elif model_name == "persistentlstm":     # <--- added so persistent 
+        model = PersistentLSTMModel(cfg=cfg)   # <--- added so persistent 
     else:
         raise NotImplementedError(f"{cfg.model} not implemented or not linked in `get_model()`")
 
