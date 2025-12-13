@@ -141,6 +141,37 @@ class BaseTester(object):
         )
         return ds
 
+    # ================= MOD: persistent-continuous detection helper =================
+    def _is_persistent_continuous_eval(self, frequencies: List[str]) -> bool:
+        """
+        True when we are in the specific case:
+        - persistent_state enabled
+        - non_overlapping_sequences enabled
+        - single frequency
+        - seq_stride is 1 or equals seq_length (common for non-overlap)
+        This is the case where NH's (date,time_step) logic is wrong.
+        """
+        if not getattr(self.cfg, "persistent_state", False):
+            return False
+        if not getattr(self.cfg, "non_overlapping_sequences", False):
+            return False
+        if len(frequencies) != 1:
+            return False
+
+        # seq_stride may not exist in older configs; default to 1
+        seq_stride = int(getattr(self.cfg, "seq_stride", 1))
+
+        # seq_length may be int or dict
+        seq_length = self.cfg.seq_length
+        if isinstance(seq_length, dict):
+            # single-frequency dict
+            freq0 = frequencies[0]
+            seq_length = int(seq_length[freq0])
+        else:
+            seq_length = int(seq_length)
+
+        return seq_stride in (1, seq_length)
+
     def evaluate(
         self,
         epoch: int = None,
@@ -214,6 +245,9 @@ class BaseTester(object):
 
             lowest_freq = sort_frequencies(ds.frequencies)[0]
 
+            # ================= MOD: decide plotting/metric mode =================
+            persistent_continuous = self._is_persistent_continuous_eval(ds.frequencies)
+
             for freq in ds.frequencies:
                 if predict_last_n[freq] == 0:
                     continue
@@ -224,6 +258,7 @@ class BaseTester(object):
                 feature_center = self.scaler["xarray_feature_center"][self.cfg.target_variables].to_array().values
                 y_freq = y[freq] * feature_scaler + feature_center
 
+                # scale y_hat (supports regression [N,L,T] and uncertainty [N,L,T,S])
                 if y_hat[freq].ndim == 3 or (len(feature_scaler) == 1):
                     y_hat_freq = y_hat[freq] * feature_scaler + feature_center
                 elif y_hat[freq].ndim == 4:
@@ -233,6 +268,72 @@ class BaseTester(object):
                 else:
                     raise RuntimeError(f"Simulations have {y_hat[freq].ndim} dimension. Only 3 and 4 are supported.")
 
+                # ================= MOD: persistent-continuous xarray =================
+                if persistent_continuous:
+                    # dates[freq] is the truth; flatten directly (no (date,time_step) grid)
+                    dt_1d = pd.to_datetime(dates[freq].reshape(-1))
+                    y_obs_1d = y_freq.reshape(-1, y_freq.shape[-1])
+
+                    if y_hat_freq.ndim == 3:
+                        y_sim_1d = y_hat_freq.reshape(-1, y_hat_freq.shape[-1])
+                        data_vars = {}
+                        for i, var in enumerate(self.cfg.target_variables):
+                            data_vars[f"{var}_obs"] = (("datetime",), y_obs_1d[:, i])
+                            data_vars[f"{var}_sim"] = (("datetime",), y_sim_1d[:, i])
+                    else:
+                        # y_hat_freq is [N_seq, L, n_targets, n_samples] -> [T, n_targets, n_samples]
+                        y_sim_1d = y_hat_freq.reshape(-1, y_hat_freq.shape[2], y_hat_freq.shape[3])
+                        data_vars = {}
+                        for i, var in enumerate(self.cfg.target_variables):
+                            data_vars[f"{var}_obs"] = (("datetime",), y_obs_1d[:, i])
+                            data_vars[f"{var}_sim"] = (("datetime", "samples"), y_sim_1d[:, i, :])
+
+                    xr = xarray.Dataset(data_vars=data_vars, coords={"datetime": dt_1d})
+                    results[basin][freq]["xr"] = xr
+
+                    # ================= MOD: metrics from true datetime series =================
+                    if metrics:
+                        for target_variable in self.cfg.target_variables:
+                            obs_ = xr[f"{target_variable}_obs"]
+                            sim_ = xr[f"{target_variable}_sim"]
+
+                            if target_variable in self.cfg.clip_targets_to_zero:
+                                sim_ = xarray.where(sim_ < 0, 0, sim_)
+
+                            if "samples" in sim_.dims:
+                                sim_ = sim_.mean(dim="samples")
+
+                            var_metrics = metrics if isinstance(metrics, list) else metrics[target_variable]
+                            if "all" in var_metrics:
+                                var_metrics = get_available_metrics()
+
+                            try:
+                                values = calculate_metrics(obs_, sim_, metrics=var_metrics, resolution=freq)
+                            except AllNaNError as err:
+                                msg = (
+                                    f"Basin {basin} "
+                                    + (f"{target_variable} " if len(self.cfg.target_variables) > 1 else "")
+                                    + (f"{freq} " if len(ds.frequencies) > 1 else "")
+                                    + str(err)
+                                )
+                                LOGGER.warning(msg)
+                                values = {metric: np.nan for metric in var_metrics}
+
+                            if len(self.cfg.target_variables) > 1:
+                                values = {f"{target_variable}_{key}": val for key, val in values.items()}
+                            if len(ds.frequencies) > 1:
+                                values = {f"{key}_{freq}": val for key, val in values.items()}
+
+                            if experiment_logger is not None:
+                                experiment_logger.log_step(**values)
+
+                            for k, v in values.items():
+                                results[basin][freq][k] = v
+
+                    # Done for this freq
+                    continue
+
+                # ---------------- ORIGINAL NH BEHAVIOR (unchanged) ----------------
                 data_vars = self._create_xarray_data_vars(y_hat_freq, y_freq)
                 frequency_factor = int(get_frequency_factor(lowest_freq, freq))
 
@@ -335,10 +436,15 @@ class BaseTester(object):
                 figures = []
                 for i in range(max_figures):
                     xr = results[basins[i]][freq]["xr"]
+
+                    # NOTE: For persistent-continuous, obs/sim are 1D.
+                    # plots.regression_plot / uncertainty_plot can handle 1D arrays.
                     obs = xr[f"{target_var}_obs"].values
                     sim = xr[f"{target_var}_sim"].values
+
                     if target_var in self.cfg.clip_targets_to_zero:
                         sim = xarray.where(sim < 0, 0, sim)
+
                     figures.append(
                         self._get_plots(
                             obs, sim, title=f"{target_var} - Basin {basins[i]} - Epoch {epoch} - Frequency {freq}"
@@ -628,7 +734,7 @@ class BaseTester(object):
                         # Normalize shapes so we can concatenate on "time axis"
                         # Accept:
                         #   [1, seg_len, ...]   (preferred)
-                        #   [seg_len, ...]      (no batch dim)  <-- user requested support
+                        #   [seg_len, ...]      (no batch dim)
                         # Reject:
                         #   [1, ...] or [layers, batch, hidden] etc. (e.g. h_n/c_n)
                         v_norm = None
@@ -637,7 +743,7 @@ class BaseTester(object):
                         elif v.dim() >= 1 and v.shape[0] == seg_len:
                             v_norm = v.unsqueeze(0)  # [1, seg_len, ...]
                         else:
-                            # Not a time-series tensor; skip (prevents h_n mismatch crash)
+                            # Not a time-series tensor; skip
                             continue
 
                         stitched.setdefault(k, []).append(v_norm.detach())
@@ -666,7 +772,7 @@ class BaseTester(object):
                 elif save_all_output:
                     all_output = {key: [value.detach().cpu().numpy()] for key, value in full_predictions.items()}
 
-                # Collect preds/obs/dates using original logic (backward compatible)
+                # Collect preds/obs/dates using original logic
                 if predict_last_n[freq] == 0:
                     continue
 
