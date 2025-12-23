@@ -71,8 +71,6 @@ class BaseTester(object):
         self._current_basin_idx_eval = None
 
         # Default behavior inside tester (NO YAML key needed):
-        # - "per_basin" is NH-safe (no cross-basin leakage even if evaluate loop changes)
-        # - If you want strict "start-only reset", change this constant to "start".
         self._persistent_eval_reset_mode = "per_basin"  # {"per_basin", "start"}
 
         self._load_run_data()
@@ -143,14 +141,6 @@ class BaseTester(object):
 
     # ================= MOD: persistent-continuous detection helper =================
     def _is_persistent_continuous_eval(self, frequencies: List[str]) -> bool:
-        """
-        True when we are in the specific case:
-        - persistent_state enabled
-        - non_overlapping_sequences enabled
-        - single frequency
-        - seq_stride is 1 or equals seq_length (common for non-overlap)
-        This is the case where NH's (date,time_step) logic is wrong.
-        """
         if not getattr(self.cfg, "persistent_state", False):
             return False
         if not getattr(self.cfg, "non_overlapping_sequences", False):
@@ -158,19 +148,46 @@ class BaseTester(object):
         if len(frequencies) != 1:
             return False
 
-        # seq_stride may not exist in older configs; default to 1
         seq_stride = int(getattr(self.cfg, "seq_stride", 1))
 
-        # seq_length may be int or dict
         seq_length = self.cfg.seq_length
         if isinstance(seq_length, dict):
-            # single-frequency dict
             freq0 = frequencies[0]
             seq_length = int(seq_length[freq0])
         else:
             seq_length = int(seq_length)
 
         return seq_stride in (1, seq_length)
+
+    # ================= STATIC: robust basin->batch-row mapping (match BaseTrainer) =================
+    @staticmethod
+    def _resolve_batch_row_for_basin(data: Dict[str, object], basin_id: int, B_expected: int) -> int:
+        """Find which original batch row corresponds to `basin_id` (robust).
+        Prefers data['basin_idx'] if it is [B]. Falls back to mapping via [B,L] if present.
+        """
+        if "basin_idx" not in data or (not torch.is_tensor(data["basin_idx"])):
+            raise RuntimeError("Persistent eval: basin_idx missing from batch; cannot map static features.")
+
+        bidx = data["basin_idx"]
+
+        # Common NH case: basin_idx is [B]
+        if bidx.dim() == 1 and int(bidx.shape[0]) == int(B_expected):
+            matches = (bidx == basin_id).nonzero(as_tuple=True)[0]
+            if matches.numel() == 0:
+                raise RuntimeError(f"Persistent eval: basin {basin_id} not found in batch basin_idx.")
+            return int(matches[0].item())
+
+        # Sometimes basin_idx might already be [B,L]
+        if bidx.dim() == 2 and int(bidx.shape[0]) == int(B_expected):
+            row_ids = bidx[:, 0]
+            matches = (row_ids == basin_id).nonzero(as_tuple=True)[0]
+            if matches.numel() == 0:
+                raise RuntimeError(f"Persistent eval: basin {basin_id} not found in batch basin_idx[:,0].")
+            return int(matches[0].item())
+
+        raise RuntimeError(
+            f"Persistent eval: unexpected basin_idx shape {tuple(bidx.shape)}; expected [B] or [B,L]."
+        )
 
     def evaluate(
         self,
@@ -200,7 +217,6 @@ class BaseTester(object):
         else:
             model.eval()
 
-        # STRICT reset option: reset once at start of evaluation
         if self._persistent_eval_reset_mode == "start":
             self._persistent_hidden_eval = None
             self._current_basin_idx_eval = None
@@ -212,7 +228,6 @@ class BaseTester(object):
         pbar.set_description("# Validation" if self.period == "validation" else "# Evaluation")
 
         for basin in pbar:
-            # NH-safe option: reset at basin boundaries
             if self._persistent_eval_reset_mode == "per_basin":
                 self._persistent_hidden_eval = None
                 self._current_basin_idx_eval = None
@@ -244,8 +259,6 @@ class BaseTester(object):
                 seq_length = {ds.frequencies[0]: seq_length}
 
             lowest_freq = sort_frequencies(ds.frequencies)[0]
-
-            # ================= MOD: decide plotting/metric mode =================
             persistent_continuous = self._is_persistent_continuous_eval(ds.frequencies)
 
             for freq in ds.frequencies:
@@ -258,7 +271,6 @@ class BaseTester(object):
                 feature_center = self.scaler["xarray_feature_center"][self.cfg.target_variables].to_array().values
                 y_freq = y[freq] * feature_scaler + feature_center
 
-                # scale y_hat (supports regression [N,L,T] and uncertainty [N,L,T,S])
                 if y_hat[freq].ndim == 3 or (len(feature_scaler) == 1):
                     y_hat_freq = y_hat[freq] * feature_scaler + feature_center
                 elif y_hat[freq].ndim == 4:
@@ -268,9 +280,7 @@ class BaseTester(object):
                 else:
                     raise RuntimeError(f"Simulations have {y_hat[freq].ndim} dimension. Only 3 and 4 are supported.")
 
-                # ================= MOD: persistent-continuous xarray =================
                 if persistent_continuous:
-                    # dates[freq] is the truth; flatten directly (no (date,time_step) grid)
                     dt_1d = pd.to_datetime(dates[freq].reshape(-1))
                     y_obs_1d = y_freq.reshape(-1, y_freq.shape[-1])
 
@@ -281,7 +291,6 @@ class BaseTester(object):
                             data_vars[f"{var}_obs"] = (("datetime",), y_obs_1d[:, i])
                             data_vars[f"{var}_sim"] = (("datetime",), y_sim_1d[:, i])
                     else:
-                        # y_hat_freq is [N_seq, L, n_targets, n_samples] -> [T, n_targets, n_samples]
                         y_sim_1d = y_hat_freq.reshape(-1, y_hat_freq.shape[2], y_hat_freq.shape[3])
                         data_vars = {}
                         for i, var in enumerate(self.cfg.target_variables):
@@ -291,7 +300,6 @@ class BaseTester(object):
                     xr = xarray.Dataset(data_vars=data_vars, coords={"datetime": dt_1d})
                     results[basin][freq]["xr"] = xr
 
-                    # ================= MOD: metrics from true datetime series =================
                     if metrics:
                         for target_variable in self.cfg.target_variables:
                             obs_ = xr[f"{target_variable}_obs"]
@@ -330,10 +338,8 @@ class BaseTester(object):
                             for k, v in values.items():
                                 results[basin][freq][k] = v
 
-                    # Done for this freq
                     continue
 
-                # ---------------- ORIGINAL NH BEHAVIOR (unchanged) ----------------
                 data_vars = self._create_xarray_data_vars(y_hat_freq, y_freq)
                 frequency_factor = int(get_frequency_factor(lowest_freq, freq))
 
@@ -436,9 +442,6 @@ class BaseTester(object):
                 figures = []
                 for i in range(max_figures):
                     xr = results[basins[i]][freq]["xr"]
-
-                    # NOTE: For persistent-continuous, obs/sim are 1D.
-                    # plots.regression_plot / uncertainty_plot can handle 1D arrays.
                     obs = xr[f"{target_var}_obs"].values
                     sim = xr[f"{target_var}_sim"].values
 
@@ -485,11 +488,12 @@ class BaseTester(object):
     # ------------------------------------------------------------------
     @staticmethod
     def _flatten_time_batch(t: torch.Tensor) -> torch.Tensor:
-        """Flatten [B, L, ...] → [1, B*L, ...]"""
+        """Flatten [B, L, ...] → [1, B*L, ...] (match BaseTrainer)"""
         if (not torch.is_tensor(t)) or t.dim() < 2:
             return t
+        t = t.contiguous()
         b, l = t.shape[0], t.shape[1]
-        return t.reshape(1, b * l, *t.shape[2:])
+        return t.view(1, b * l, *t.shape[2:])
 
     def _slice_time_segment(self, data_dict: Dict[str, object], segment_slice: slice) -> Dict[str, object]:
         """Slice a contiguous segment from reshaped data (expects time-like tensors as [1, L_new, ...])."""
@@ -498,7 +502,7 @@ class BaseTester(object):
             if key.startswith("x_d"):
                 seg[key] = {feat: v[:, segment_slice, ...] for feat, v in val.items()}
             elif key.startswith("x_s"):
-                seg[key] = val
+                seg[key] = val  # overwritten per segment below
             elif key.startswith("y") or key.startswith("basin_idx"):
                 if torch.is_tensor(val):
                     if val.dim() == 1:
@@ -508,7 +512,7 @@ class BaseTester(object):
                 else:
                     seg[key] = val
             elif key.startswith("date"):
-                seg[key] = val  # keep as-is
+                seg[key] = val
             elif torch.is_tensor(val) and val.dim() >= 2:
                 seg[key] = val[:, segment_slice, ...]
             else:
@@ -516,7 +520,6 @@ class BaseTester(object):
         return seg
 
     def _is_persistent_mirror_eval(self, frequencies: List[str]) -> bool:
-        # Keep this strict to avoid breaking multi-frequency models
         return (
             getattr(self.cfg, "persistent_state", False)
             and self.cfg.model.lower() == "persistentlstm"
@@ -600,9 +603,7 @@ class BaseTester(object):
     def _evaluate_persistent_mirror_training(
         self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False
     ):
-        """Mirror BaseTrainer persistent logic 1:1, stitch outputs back to [B, L, ...],
-        and compute global timestep-weighted mean losses across the entire loader (NaN-safe).
-        """
+        """Mirror BaseTrainer persistent logic, INCLUDING static attributes slicing."""
         freq = frequencies[0]
         predict_last_n = self.cfg.predict_last_n
         if isinstance(predict_last_n, int):
@@ -610,13 +611,11 @@ class BaseTester(object):
 
         preds, obs, dates, all_output = {}, {}, {}, {}
 
-        # Global timestep-weighted loss accumulators across loader
         loss_sum: Dict[str, float] = {}
         loss_w: Dict[str, int] = {}
 
         with torch.no_grad():
             for data in loader:
-                # move to device
                 for key in data.keys():
                     if key.startswith("x_d"):
                         data[key] = {k: v.to(self.device) for k, v in data[key].items()}
@@ -625,7 +624,6 @@ class BaseTester(object):
 
                 data = model.pre_model_hook(data, is_train=False)
 
-                # infer B, L from any x_d tensor
                 any_xd = None
                 for k, v in data.items():
                     if k.startswith("x_d") and isinstance(v, dict) and len(v) > 0:
@@ -635,13 +633,12 @@ class BaseTester(object):
                     raise RuntimeError("Persistent eval: could not infer [B, L] from x_d.")
                 B, L = int(any_xd.shape[0]), int(any_xd.shape[1])
 
-                # ----- Step 1: Build reshaped_data with flattened time dimension -----
                 reshaped_data: Dict[str, object] = {}
                 for key, val in data.items():
                     if key.startswith("x_d"):
                         reshaped_data[key] = {feat: self._flatten_time_batch(v) for feat, v in val.items()}
                     elif key.startswith("x_s"):
-                        reshaped_data[key] = val
+                        reshaped_data[key] = val  # sliced per segment
                     elif key.startswith("y"):
                         reshaped_data[key] = self._flatten_time_batch(val)
                     elif key.startswith("basin_idx"):
@@ -664,7 +661,6 @@ class BaseTester(object):
                 if L_new == 0:
                     continue
 
-                # ----- Step 2: Split flattened sequence by basin changes -----
                 diff = basin_indices_flat[1:] - basin_indices_flat[:-1]
                 change_points = torch.where(diff != 0)[0] + 1
 
@@ -676,20 +672,37 @@ class BaseTester(object):
                     start = cp_int
                 segment_slices.append(slice(start, L_new))
 
-                # ----- Step 3: loop over segments (exact reset logic as trainer) -----
                 hidden = self._persistent_hidden_eval
                 prev_basin_id = None
-
-                # stitched time outputs (flat, then reshape back to [B, L, ...])
                 stitched: Dict[str, List[torch.Tensor]] = {}
 
                 for i_seg, seg_slice in enumerate(segment_slices):
                     seg_data = self._slice_time_segment(reshaped_data, seg_slice)
+
                     seg_basin_ids = seg_data["basin_idx"].view(-1)
                     basin_id_this_seg = int(seg_basin_ids[0].item())
                     seg_len = int(seg_basin_ids.numel())
 
-                    # EXACT reset logic from trainer:
+                    # ---------------------------
+                    # STATIC ATTRIBUTES (match BaseTrainer):
+                    # pick correct original batch row for this basin and slice x_s to [1,...]
+                    # ---------------------------
+                    if any(k.startswith("x_s") for k in data.keys()):
+                        try:
+                            orig_b = self._resolve_batch_row_for_basin(data, basin_id_this_seg, B)
+                        except Exception:
+                            # fallback mapping (only if basin_idx isn't [B] or unexpected)
+                            seg_start = int(seg_slice.start)
+                            orig_b = seg_start // L
+
+                        for sk, sv in data.items():
+                            if sk.startswith("x_s"):
+                                if isinstance(sv, dict):
+                                    seg_data[sk] = {feat: v[orig_b:orig_b + 1, ...] for feat, v in sv.items()}
+                                else:
+                                    seg_data[sk] = sv[orig_b:orig_b + 1, ...]
+
+                    # reset logic
                     if i_seg == 0:
                         if self._current_basin_idx_eval is None or basin_id_this_seg != self._current_basin_idx_eval:
                             hidden = None
@@ -699,7 +712,6 @@ class BaseTester(object):
 
                     seg_preds = model(seg_data, hidden_state=hidden)
 
-                    # update hidden (detach)
                     new_hidden = seg_preds.get("hidden_state", None)
                     if new_hidden is not None:
                         h, c = new_hidden
@@ -707,54 +719,37 @@ class BaseTester(object):
                     else:
                         hidden = None
 
-                    # loss for this segment
                     _, seg_all_losses = self.loss_obj(seg_preds, seg_data)
 
-                    # Global timestep-weighted mean across loader (NaN-safe)
                     for k, v in seg_all_losses.items():
-                        if torch.is_tensor(v):
-                            v_item = float(v.detach().cpu().item())
-                        else:
-                            v_item = float(v)
+                        v_item = float(v.detach().cpu().item()) if torch.is_tensor(v) else float(v)
                         if np.isfinite(v_item):
                             loss_sum[k] = loss_sum.get(k, 0.0) + v_item * seg_len
                             loss_w[k] = loss_w.get(k, 0) + seg_len
 
-                    # Stitch time-like outputs.
-                    # RULE: only stitch tensors that clearly have a time axis = seg_len
                     for k, v in seg_preds.items():
                         if v is None or isinstance(v, dict):
                             continue
                         if k == "hidden_state":
                             continue
-
                         if not torch.is_tensor(v):
                             continue
 
-                        # Normalize shapes so we can concatenate on "time axis"
-                        # Accept:
-                        #   [1, seg_len, ...]   (preferred)
-                        #   [seg_len, ...]      (no batch dim)
-                        # Reject:
-                        #   [1, ...] or [layers, batch, hidden] etc. (e.g. h_n/c_n)
                         v_norm = None
                         if v.dim() >= 2 and v.shape[0] == 1 and v.shape[1] == seg_len:
                             v_norm = v
                         elif v.dim() >= 1 and v.shape[0] == seg_len:
-                            v_norm = v.unsqueeze(0)  # [1, seg_len, ...]
+                            v_norm = v.unsqueeze(0)
                         else:
-                            # Not a time-series tensor; skip
                             continue
 
                         stitched.setdefault(k, []).append(v_norm.detach())
 
                     prev_basin_id = basin_id_this_seg
 
-                # persist last hidden state across batches (same as trainer)
                 self._persistent_hidden_eval = hidden
                 self._current_basin_idx_eval = prev_basin_id
 
-                # Build a full-batch predictions dict (time outputs reshaped back to [B, L, ...])
                 full_predictions: Dict[str, torch.Tensor] = {}
                 for k, parts in stitched.items():
                     flat = torch.cat(parts, dim=1)  # [1, B*L, ...]
@@ -765,18 +760,16 @@ class BaseTester(object):
                     new_shape = (B, L) + tuple(flat.shape[2:])
                     full_predictions[k] = flat.reshape(*new_shape)
 
-                # Save all_output if requested
                 if all_output:
                     for key, value in full_predictions.items():
                         all_output[key].append(value.detach().cpu().numpy())
                 elif save_all_output:
                     all_output = {key: [value.detach().cpu().numpy()] for key, value in full_predictions.items()}
 
-                # Collect preds/obs/dates using original logic
                 if predict_last_n[freq] == 0:
                     continue
 
-                freq_key = ""  # single freq
+                freq_key = ""
                 y_hat_sub, y_sub = self._subset_targets(model, data, full_predictions, predict_last_n[freq], freq_key)
                 date_sub = data[f"date{freq_key}"][:, -predict_last_n[freq] :]
 
@@ -789,7 +782,6 @@ class BaseTester(object):
                     obs[freq] = torch.cat((obs[freq], y_sub.detach().cpu()), 0)
                     dates[freq] = np.concatenate((dates[freq], date_sub), axis=0)
 
-        # finalize arrays
         for f in preds.keys():
             preds[f] = preds[f].numpy()
             obs[f] = obs[f].numpy()
@@ -797,16 +789,12 @@ class BaseTester(object):
         for key, list_of_data in all_output.items():
             all_output[key] = np.concatenate(list_of_data, 0)
 
-        # Global timestep-weighted mean losses over entire loader
         mean_losses = {}
         if len(loss_sum) == 0:
             mean_losses["loss"] = np.nan
         else:
             for k in loss_sum.keys():
-                if loss_w.get(k, 0) > 0:
-                    mean_losses[k] = loss_sum[k] / loss_w[k]
-                else:
-                    mean_losses[k] = np.nan
+                mean_losses[k] = (loss_sum[k] / loss_w[k]) if loss_w.get(k, 0) > 0 else np.nan
 
         return preds, obs, dates, mean_losses, all_output
 
@@ -836,7 +824,6 @@ class RegressionTester(BaseTester):
     def _subset_targets(
         self, model: BaseModel, data: Dict[str, torch.Tensor], predictions: dict, predict_last_n: int, freq: str
     ):
-        # freq is "" for single-frequency, or "_<freq>" for multi-frequency
         y_hat_sub = predictions[f"y_hat{freq}"][:, -predict_last_n:, :]
         y_sub = data[f"y{freq}"][:, -predict_last_n:, :]
         return y_hat_sub, y_sub
