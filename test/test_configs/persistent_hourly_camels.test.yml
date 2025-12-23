@@ -70,7 +70,9 @@ dynamic_inputs:
   - temperature
 target_variables:
   - qobs_mm_per_hour
-
+static_attributes:            
+  - elev_mean
+  - slope_mean
 # --- Persistent sampling configuration ------------------------------------------------------------
 non_overlapping_sequences: true
 seq_stride: 2
