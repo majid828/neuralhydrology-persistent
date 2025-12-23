@@ -101,49 +101,71 @@ class BaseTrainer(object):
     def _flatten_time_batch(t: torch.Tensor) -> torch.Tensor:
         """Flatten [B, L, ...] → [1, B*L, ...] along the first two dims.
 
-        
-        This helper used to be defined inside the training loop in `_train_epoch`,
-        which redefined the function for every batch. It is now moved out as a
-        static method to avoid that bad practice and to keep the code efficient.
+        IMPORTANT: enforce contiguity to make the flatten mapping deterministic.
         """
-        if t.dim() < 2:
-            # Nothing to flatten, return as-is
+        if not torch.is_tensor(t) or t.dim() < 2:
             return t
+        t = t.contiguous()
         b, l = t.shape[0], t.shape[1]
-        remaining = t.shape[2:]  # can be empty, or (F,), (F1, F2), ...
+        remaining = t.shape[2:]
         new_shape = (1, b * l) + remaining
-        return t.reshape(*new_shape)
+        return t.view(*new_shape)
 
     def _slice_time_segment(self, data_dict: Dict[str, object], segment_slice: slice) -> Dict[str, object]:
         """Slice a contiguous time segment from reshaped data.
 
         Expects time-like tensors to have shape [1, L_new, ...] after `_flatten_time_batch`.
-        Static (x_s) and non-tensor entries are kept as-is.
+        Static (x_s) and non-tensor entries are kept as-is (but we will overwrite x_s per segment in train loop).
         """
         seg = {}
         for key, val in data_dict.items():
             if key.startswith("x_d"):
-                # Dynamic inputs: dict of feature tensors
                 seg[key] = {feat: v[:, segment_slice, ...] for feat, v in val.items()}
             elif key.startswith("x_s"):
-                # Static features: do not depend on time
-                seg[key] = val
+                seg[key] = val  # overwritten per segment later
             elif key.startswith("y") or key.startswith("basin_idx"):
                 if torch.is_tensor(val):
                     if val.dim() == 1:
-                        # 1D case: just slice directly
                         seg[key] = val[segment_slice]
                     else:
-                        # 2D+ case: [1, L_new, ...]
                         seg[key] = val[:, segment_slice, ...]
                 else:
                     seg[key] = val
             elif torch.is_tensor(val) and val.dim() >= 2:
                 seg[key] = val[:, segment_slice, ...]
             else:
-                # Non-tensor (e.g., dates, lists, strings) or scalars: keep as-is
                 seg[key] = val
         return seg
+
+    @staticmethod
+    def _resolve_batch_row_for_basin(data: Dict[str, object], basin_id: int, B_expected: int) -> int:
+        """Find which original batch row corresponds to `basin_id` (robust).
+        Prefers data['basin_idx'] if it is [B]. Falls back to mapping via [B,L] if present.
+        """
+        if "basin_idx" not in data or (not torch.is_tensor(data["basin_idx"])):
+            raise RuntimeError("PersistentLSTM: basin_idx missing from batch; cannot map static features.")
+
+        bidx = data["basin_idx"]
+
+        # Common NH case: basin_idx is [B]
+        if bidx.dim() == 1 and int(bidx.shape[0]) == int(B_expected):
+            matches = (bidx == basin_id).nonzero(as_tuple=True)[0]
+            if matches.numel() == 0:
+                raise RuntimeError(f"PersistentLSTM: basin {basin_id} not found in batch basin_idx.")
+            return int(matches[0].item())
+
+        # Sometimes basin_idx might already be [B,L] (rare but handle)
+        if bidx.dim() == 2 and int(bidx.shape[0]) == int(B_expected):
+            # Each row should be constant basin id; take first column
+            row_ids = bidx[:, 0]
+            matches = (row_ids == basin_id).nonzero(as_tuple=True)[0]
+            if matches.numel() == 0:
+                raise RuntimeError(f"PersistentLSTM: basin {basin_id} not found in batch basin_idx[:,0].")
+            return int(matches[0].item())
+
+        raise RuntimeError(
+            f"PersistentLSTM: unexpected basin_idx shape {tuple(bidx.shape)}; expected [B] or [B,L]."
+        )
 
     def _get_dataset(self) -> BaseDataset:
         return get_dataset(cfg=self.cfg, period="train", is_train=True, scaler=self._scaler)
@@ -209,12 +231,7 @@ class BaseTrainer(object):
             LOGGER.warning(f"Could not resolve the following module parts for finetuning: {unresolved_modules}")
 
     def initialize_training(self):
-        """Initialize the training class.
-
-        This method will load the model, initialize loss, regularization, optimizer, dataset and dataloader,
-        tensorboard logging, and Tester class.
-        If called in a ``continue_training`` context, this model will also restore the model and optimizer state.
-        """
+        """Initialize the training class."""
         if self.cfg.is_finetuning:
             # Load scaler from pre-trained model.
             self._scaler = load_scaler(self.cfg.base_run_dir)
@@ -230,7 +247,6 @@ class BaseTrainer(object):
             LOGGER.info(f"Starting training from Checkpoint {self.cfg.checkpoint_path}")
             self.model.load_state_dict(torch.load(str(self.cfg.checkpoint_path), map_location=self.device))
         elif self.cfg.checkpoint_path is None and self.cfg.is_finetuning:
-            # the default for finetuning is the last model state
             checkpoint_path = [x for x in sorted(list(self.cfg.base_run_dir.glob('model_epoch*.pt')))][-1]
             LOGGER.info(f"Starting training from checkpoint {checkpoint_path}")
             self.model.load_state_dict(torch.load(str(checkpoint_path), map_location=self.device))
@@ -254,7 +270,6 @@ class BaseTrainer(object):
             self.experiment_logger.start_tb()
 
         if self.cfg.is_continue_training:
-            # set epoch and iteration step counter to continue from the selected checkpoint
             self.experiment_logger.epoch = self._epoch
             self.experiment_logger.update = len(self.loader) * self._epoch
 
@@ -271,16 +286,14 @@ class BaseTrainer(object):
         if self.cfg.target_noise_std is not None:
             self.noise_sampler_y = torch.distributions.Normal(loc=0, scale=self.cfg.target_noise_std)
             self._target_mean = torch.from_numpy(
-                ds.scaler["xarray_feature_center"][self.cfg.target_variables].to_array().values).to(self.device)
+                ds.scaler["xarray_feature_center"][self.cfg.target_variables].to_array().values
+            ).to(self.device)
             self._target_std = torch.from_numpy(
-                ds.scaler["xarray_feature_scale"][self.cfg.target_variables].to_array().values).to(self.device)
+                ds.scaler["xarray_feature_scale"][self.cfg.target_variables].to_array().values
+            ).to(self.device)
 
     def train_and_validate(self):
-        """Train and validate the model.
-
-        Train the model for the number of epochs specified in the run configuration, and perform validation after every
-        ``validate_every`` epochs. Model and optimizer state are saved after every ``save_weights_every`` epochs.
-        """
+        """Train and validate the model."""
         if self._early_stopping:
             if self.cfg.is_continue_training:
                 LOGGER.warning("Early stopping state is reset.")
@@ -311,19 +324,22 @@ class BaseTrainer(object):
                 self._save_weights_and_optimizer(epoch)
 
             if (self.validator is not None) and (epoch % self.cfg.validate_every == 0):
-                self.validator.evaluate(epoch=epoch,
-                                        save_results=self.cfg.save_validation_results,
-                                        save_all_output=self.cfg.save_all_output,
-                                        metrics=self.cfg.metrics,
-                                        model=self.model,
-                                        experiment_logger=self.experiment_logger.valid())
+                self.validator.evaluate(
+                    epoch=epoch,
+                    save_results=self.cfg.save_validation_results,
+                    save_all_output=self.cfg.save_all_output,
+                    metrics=self.cfg.metrics,
+                    model=self.model,
+                    experiment_logger=self.experiment_logger.valid()
+                )
 
                 valid_metrics = self.experiment_logger.summarise()
                 print_msg = f"Epoch {epoch} average validation loss: {valid_metrics['avg_total_loss']:.5f}"
                 if self.cfg.metrics:
                     print_msg += f" -- Median validation metrics: "
-                    print_msg += ", ".join(f"{k}: {v:.5f}" for k, v in valid_metrics.items()
-                                           if k != 'avg_total_loss')
+                    print_msg += ", ".join(
+                        f"{k}: {v:.5f}" for k, v in valid_metrics.items() if k != 'avg_total_loss'
+                    )
                     LOGGER.info(print_msg)
 
                 if self._early_stopping and epoch > self._minimum_epochs_before_early_stopping and \
@@ -333,10 +349,10 @@ class BaseTrainer(object):
                         f"{valid_metrics['avg_total_loss']:.5f}. Training stopped."
                     )
                     break
+
                 if self._dynamic_learning_rate:
                     scheduler.step(valid_metrics['avg_total_loss'])
 
-        # make sure to close tensorboard to avoid losing the last epoch
         if self.cfg.log_tensorboard:
             self.experiment_logger.stop_tb()
 
@@ -381,13 +397,11 @@ class BaseTrainer(object):
             self._persistent_hidden = None
             self._current_basin_idx = None
 
-        # progress bar handle
         n_iter = min(self._max_updates_per_epoch, len(self.loader)) \
             if self._max_updates_per_epoch is not None else None
         pbar = tqdm(self.loader, file=sys.stdout, disable=self._disable_pbar, total=n_iter)
         pbar.set_description(f'# Epoch {epoch}')
 
-        # Iterate in batches over training set
         nan_count = 0
         for i, data in enumerate(pbar):
             if self._max_updates_per_epoch is not None and i >= self._max_updates_per_epoch:
@@ -400,98 +414,72 @@ class BaseTrainer(object):
                 elif not key.startswith('date'):
                     data[key] = data[key].to(self.device)
 
-            # apply possible pre-processing to the batch before the forward pass
+            # pre-processing hook
             data = self.model.pre_model_hook(data, is_train=True)
 
             # --------------------------------------------------
-            # PERSISTENT LSTM: reshape [B, L, F] -> [1, B*L, F]
-            # and process the batch as basin-consistent segments.
-            # Persistent hidden state is carried across batches,
-            # but NOT across different basins.
+            # PERSISTENT LSTM branch
             # --------------------------------------------------
             if self.persistent_state and self.cfg.model.lower() == "persistentlstm":
+
+                # infer B and L once
+                any_feat = None
+                for dk, dv in data.items():
+                    if dk.startswith("x_d") and isinstance(dv, dict) and len(dv) > 0:
+                        any_feat = next(iter(dv.values()))
+                        break
+                if any_feat is None or (not torch.is_tensor(any_feat)) or any_feat.dim() < 2:
+                    raise RuntimeError("PersistentLSTM: could not infer B,L because no valid x_d tensor found.")
+                B_inferred = int(any_feat.shape[0])
+                L_inferred = int(any_feat.shape[1])
 
                 # ----- Step 1: Build reshaped_data with flattened time dimension -----
                 reshaped_data: Dict[str, object] = {}
 
                 for key, val in data.items():
                     if key.startswith("x_d"):
-                        # Dynamic inputs: dict of feature tensors
-                        # Each v is [B, L, F_feat] (or similar) -> [1, B*L, F_feat]
                         reshaped_data[key] = {feat: self._flatten_time_batch(v) for feat, v in val.items()}
 
                     elif key.startswith("x_s"):
-                        # Static features do not depend on time; keep them as they are.
+                        # keep as-is; will slice per segment to [1, ...]
                         reshaped_data[key] = val
 
                     elif key.startswith("y"):
-                        # Targets: [B, L, n_targets] -> [1, B*L, n_targets]
                         reshaped_data[key] = self._flatten_time_batch(val)
 
                     elif key.startswith("basin_idx"):
-                        # Basin indices: we need them aligned with time [B, L]
-                        # so that after flattening we get [1, B*L].
+                        # basin_idx should become [1, B*L]
                         if torch.is_tensor(val) and val.dim() == 1:
-                            # Shape [B]; expand to [B, L] using any x_d to infer L
-                            L_inferred = None
-                            for dk, dv in data.items():
-                                if dk.startswith("x_d"):
-                                    any_feat = next(iter(dv.values()))
-                                    # expect [B, L, ...]
-                                    L_inferred = any_feat.shape[1]
-                                    break
-                            if L_inferred is None:
-                                raise RuntimeError("Could not infer sequence length L to expand basin_idx.")
-
-                            B = val.shape[0]
-                            basin_2d = val.view(B, 1).expand(B, L_inferred)
+                            basin_2d = val.view(B_inferred, 1).expand(B_inferred, L_inferred)
                             reshaped_data[key] = self._flatten_time_batch(basin_2d)
                         else:
-                            # If already [B, L] or higher-dim, just flatten normally
                             reshaped_data[key] = self._flatten_time_batch(val)
 
                     else:
-                        # Other keys: dates, masks, etc.
                         if torch.is_tensor(val):
-                            # If it looks like time-series (>=2 dims), flatten B and L.
                             if val.dim() >= 2:
                                 reshaped_data[key] = self._flatten_time_batch(val)
                             else:
-                                # 1D tensors: [N] -> [1, N]
                                 reshaped_data[key] = val.view(1, -1) if val.dim() == 1 else val
                         else:
-                            # Non-tensor (e.g. strings, lists) -> keep as-is
                             reshaped_data[key] = val
 
                 # ----- Step 2: Split the flattened sequence into basin segments -----
-                # Previously, the hidden state was only reset when the FIRST basin of a batch
-                # changed relative to the previous batch. If multiple basins occurred inside
-                # a single batch, the hidden state could leak from one basin into another.
-                # Here we address that by:
-                # - Flattening basin_idx to [L_new]
-                # - Finding change points where basin_idx changes
-                # - Splitting the long sequence into contiguous basin-homogeneous segments
-                # - Running the model on each segment separately and resetting hidden
-                #   whenever the basin changes (within or across batches).
                 basin_indices_flat = reshaped_data["basin_idx"].view(-1)
                 L_new = basin_indices_flat.size(0)
 
                 if L_new == 0:
-                    # Degenerate case: nothing to train on in this batch
                     continue
 
-                # Find indices where basin changes between consecutive time steps
                 diff = basin_indices_flat[1:] - basin_indices_flat[:-1]
-                change_points = torch.where(diff != 0)[0] + 1  # +1 to get slice boundaries
+                change_points = torch.where(diff != 0)[0] + 1
 
-                # Build list of slices for segments of constant basin_idx
                 segment_slices = []
                 start = 0
                 for cp in change_points:
                     cp_int = int(cp.item())
                     segment_slices.append(slice(start, cp_int))
                     start = cp_int
-                # Last segment
                 segment_slices.append(slice(start, L_new))
 
                 # ----- Step 3: Loop over segments, manage hidden state, accumulate loss -----
@@ -505,13 +493,30 @@ class BaseTrainer(object):
                 for i_seg, segment_slice in enumerate(segment_slices):
                     seg_data = self._slice_time_segment(reshaped_data, segment_slice)
 
-                    # Basin id for this whole segment (all equal by construction)
+                    # Basin id for this segment (constant)
                     seg_basin_ids = seg_data["basin_idx"].view(-1)
                     basin_id_this_seg = int(seg_basin_ids[0].item())
 
-                    # Inter-batch and intra-batch reset logic:
-                    # - For the first segment, compare with _current_basin_idx (previous batch)
-                    # - For later segments, reset when basin changes relative to previous segment
+                    # ---------------------------
+                    # STATIC ATTRIBUTES FIX:
+                    # slice x_s to [1, ...] based on basin_id (robust)
+                    # ---------------------------
+                    if any(k.startswith("x_s") for k in data.keys()):
+                        try:
+                            orig_b = self._resolve_batch_row_for_basin(data, basin_id_this_seg, B_inferred)
+                        except Exception:
+                            # fallback mapping (only if basin_idx isn't [B] or unexpected)
+                            seg_start = int(segment_slice.start)
+                            orig_b = seg_start // L_inferred
+
+                        for sk, sv in data.items():
+                            if sk.startswith("x_s"):
+                                if isinstance(sv, dict):
+                                    seg_data[sk] = {feat: v[orig_b:orig_b + 1, ...] for feat, v in sv.items()}
+                                else:
+                                    seg_data[sk] = sv[orig_b:orig_b + 1, ...]
+
+                    # Reset logic (same as your version)
                     if i_seg == 0:
                         if self._current_basin_idx is None or basin_id_this_seg != self._current_basin_idx:
                             hidden = None
@@ -519,10 +524,10 @@ class BaseTrainer(object):
                         if prev_basin_id is not None and basin_id_this_seg != prev_basin_id:
                             hidden = None
 
-                    # Forward pass on this segment
+                    # Forward pass
                     preds = self.model(seg_data, hidden_state=hidden)
 
-                    # Extract and detach new hidden (if provided)
+                    # Update hidden (detach)
                     new_hidden = preds.get("hidden_state", None)
                     if new_hidden is not None:
                         h, c = new_hidden
@@ -530,12 +535,11 @@ class BaseTrainer(object):
                     else:
                         hidden = None
 
-                    # Segment loss and per-component losses
+                    # Segment loss
                     seg_loss, seg_all_losses = self.loss_obj(preds, seg_data)
-
                     seg_len = seg_basin_ids.numel()
 
-                    # Weighted accumulation by segment length to obtain global average
+                    # Weighted accumulation
                     if total_loss is None:
                         total_loss = seg_loss * seg_len
                     else:
@@ -546,11 +550,7 @@ class BaseTrainer(object):
                         accumulated_losses = {k: v * seg_len for k, v in seg_all_losses.items()}
                     else:
                         for k, v in seg_all_losses.items():
-                            if k in accumulated_losses:
-                                accumulated_losses[k] = accumulated_losses[k] + v * seg_len
-                            else:
-                                # Just in case new keys appear, handle gracefully
-                                accumulated_losses[k] = v * seg_len
+                            accumulated_losses[k] = accumulated_losses.get(k, 0.0) + v * seg_len
 
                     prev_basin_id = basin_id_this_seg
 
@@ -559,7 +559,6 @@ class BaseTrainer(object):
                 all_losses = {k: v / total_len for k, v in accumulated_losses.items()}
 
                 # ----- Step 4: Update persistent hidden state and current basin -----
-                # We keep the hidden state of the *last* segment and its basin id
                 self._persistent_hidden = hidden
                 self._current_basin_idx = prev_basin_id
 
@@ -579,16 +578,12 @@ class BaseTrainer(object):
             else:
                 nan_count = 0
 
-                # delete old gradients
                 self.optimizer.zero_grad()
-
-                # get gradients
                 loss.backward()
 
                 if self.cfg.clip_gradient_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.clip_gradient_norm)
 
-                # update weights
                 self.optimizer.step()
 
             pbar.set_postfix_str(f"Loss: {loss.item():.4f}")
@@ -598,7 +593,6 @@ class BaseTrainer(object):
         if self.cfg.seed is None:
             self.cfg.seed = int(np.random.uniform(low=0, high=1e6))
 
-        # fix random seeds for various packages
         random.seed(self.cfg.seed)
         np.random.seed(self.cfg.seed)
         torch.cuda.manual_seed(self.cfg.seed)
@@ -629,15 +623,12 @@ class BaseTrainer(object):
         LOGGER.info(f"### Device {self.device} will be used for training")
 
     def _create_folder_structure(self):
-        # create as subdirectory within run directory of base run
         if self.cfg.is_continue_training:
             folder_name = f"continue_training_from_epoch{self._epoch:03d}"
 
-            # store dir of base run for easier access in weight loading
             self.cfg.base_run_dir = self.cfg.run_dir
             self.cfg.run_dir = self.cfg.run_dir / folder_name
 
-        # create as new folder structure
         else:
             now = datetime.now()
             day = f"{now.day}".zfill(2)
@@ -647,13 +638,11 @@ class BaseTrainer(object):
             second = f"{now.second}".zfill(2)
             run_name = f'{self.cfg.experiment_name}_{day}{month}_{hour}{minute}{second}'
 
-            # if no directory for the runs is specified, a 'runs' folder will be created in the current working dir
             if self.cfg.run_dir is None:
                 self.cfg.run_dir = Path().cwd() / "runs" / run_name
             else:
                 self.cfg.run_dir = self.cfg.run_dir / run_name
 
-        # create folder + necessary subfolder
         if not self.cfg.run_dir.is_dir():
             self.cfg.train_dir = self.cfg.run_dir / "train_data"
             self.cfg.train_dir.mkdir(parents=True)
