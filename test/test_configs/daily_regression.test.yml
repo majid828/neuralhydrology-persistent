@@ -66,6 +66,6 @@ dynamic_inputs: # will be filled by conftest
   - temperature
 target_variables:
   - qobs_mm_per_hour
-static_attributes:            # I am not using static attributes in persistent lstm so we dont need to enable them during comparison!!!
+static_attributes:            
   - elev_mean
   - slope_mean
