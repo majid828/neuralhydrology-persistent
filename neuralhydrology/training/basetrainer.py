@@ -498,8 +498,8 @@ class BaseTrainer(object):
                     basin_id_this_seg = int(seg_basin_ids[0].item())
 
                     # ---------------------------
-                    # STATIC ATTRIBUTES FIX:
-                    # slice x_s to [1, ...] based on basin_id (robust)
+                    # STATIC ATTRIBUTES:
+                    # slice x_s to [1, ...] based on basin_id
                     # ---------------------------
                     if any(k.startswith("x_s") for k in data.keys()):
                         try:
@@ -516,7 +516,7 @@ class BaseTrainer(object):
                                 else:
                                     seg_data[sk] = sv[orig_b:orig_b + 1, ...]
 
-                    # Reset logic (same as your version)
+                    # Reset logic
                     if i_seg == 0:
                         if self._current_basin_idx is None or basin_id_this_seg != self._current_basin_idx:
                             hidden = None
