@@ -8,10 +8,10 @@ validation_basin_file: ./test/test_data/4_basins_test_set.txt
 test_basin_file: ./test/test_data/4_basins_test_set.txt
 
 train_start_date: '01/01/2000'
-train_end_date: '31/08/2002'
-validation_start_date: '01/09/2002'
-validation_end_date: '31/10/2002'
-test_start_date: '01/11/2002'
+train_end_date: '31/12/2001'
+validation_start_date: '01/01/2001'
+validation_end_date: '31/12/2002'
+test_start_date: '01/01/2001'
 test_end_date: '31/12/2002'
 
 seed: 111
@@ -32,7 +32,7 @@ model: persistentlstm
 head: regression
 output_activation: linear
 
-hidden_size: 128
+hidden_size: 16
 initial_forget_bias: 3
 output_dropout: 0.4
 
@@ -48,7 +48,7 @@ learning_rate:
   20: 1e-4
 
 batch_size: 64
-epochs: 40
+epochs: 60
 clip_gradient_norm: 1
 
 seq_length: 2
