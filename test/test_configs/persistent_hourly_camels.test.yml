@@ -51,7 +51,7 @@ batch_size: 64
 epochs: 50
 clip_gradient_norm: 1
 
-seq_length: &SEQ 1
+seq_length: &SEQ 2
 predict_last_n: *SEQ
 
 num_workers: 0
