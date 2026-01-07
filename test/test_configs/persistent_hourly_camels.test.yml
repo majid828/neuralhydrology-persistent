@@ -9,9 +9,9 @@ test_basin_file: ./test/test_data/4_basins_test_set.txt
 
 train_start_date: '01/01/2000'
 train_end_date: '31/12/2001'
-validation_start_date: '01/01/2001'
-validation_end_date: '31/12/2002'
-test_start_date: '01/01/2001'
+validation_start_date: '01/01/2002'
+validation_end_date: '30/06/2002'
+test_start_date: '01/07/2002'
 test_end_date: '31/12/2002'
 
 seed: 111
@@ -32,7 +32,7 @@ model: persistentlstm
 head: regression
 output_activation: linear
 
-hidden_size: 16
+hidden_size: 256
 initial_forget_bias: 3
 output_dropout: 0.4
 
@@ -48,11 +48,11 @@ learning_rate:
   20: 1e-4
 
 batch_size: 64
-epochs: 60
+epochs: 50
 clip_gradient_norm: 1
 
-seq_length: 2
-predict_last_n: 2
+seq_length: &SEQ 1
+predict_last_n: *SEQ
 
 num_workers: 0
 log_interval: 5
@@ -75,4 +75,4 @@ static_attributes:
   - slope_mean
 # --- Persistent sampling configuration ------------------------------------------------------------
 non_overlapping_sequences: true
-seq_stride: 2
+seq_stride: *SEQ
