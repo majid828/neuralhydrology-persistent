@@ -80,7 +80,7 @@ class Config(object):
 
     def as_dict(self) -> dict:
         """Return run configuration as dictionary.
-        
+
         Returns
         -------
         dict
@@ -136,10 +136,10 @@ class Config(object):
 
     def update_config(self, yml_path_or_dict: Union[Path, dict], dev_mode: bool = False):
         """Update config arguments.
-        
+
         Useful e.g. in the context of fine-tuning or when continuing to train from a checkpoint to adapt for example the
         learning rate, train basin files or anything else.
-        
+
         Parameters
         ----------
         yml_path_or_dict : Union[Path, dict]
@@ -773,6 +773,45 @@ class Config(object):
         return self._cfg.get("persistent_state", False)
 
     @property
+    def persist_state_across_epochs(self) -> bool:
+        """If True, save per-basin (h,c) at end of an epoch and reload next epoch."""
+        return self._cfg.get("persist_state_across_epochs", False)
+
+    @property
+    def shuffle_basins_each_epoch(self) -> bool:
+        """If True, shuffle basin order each epoch (trainer must implement)."""
+        return self._cfg.get("shuffle_basins_each_epoch", False)
+
+    @property
+    def persistent_state_dir(self) -> Path:
+        """Directory where per-basin states are stored.
+
+        If a relative path is provided, it is interpreted relative to `run_dir` (if available),
+        otherwise relative to the current working directory.
+        """
+        raw = self._cfg.get("persistent_state_dir", "persistent_states")
+        p = Path(raw)
+
+        if p.is_absolute():
+            return p
+
+        # If we have a run_dir, prefer that as base so states live inside the run.
+        rd = self._cfg.get("run_dir", None)
+        if rd is not None:
+            try:
+                return Path(rd) / p
+            except Exception:
+                # If run_dir isn't a proper Path yet for some reason, fall back.
+                return p
+
+        return p
+
+    @property
+    def use_persistent_state_files_in_eval(self) -> bool:
+        """If True, evaluation can load the persistent state files as initial states (if implemented in tester)."""
+        return self._cfg.get("use_persistent_state_files_in_eval", False)
+
+    @property
     def non_overlapping_sequences(self) -> bool:
         """
         If True, BaseDataset will subsample valid samples so that sequences
@@ -939,7 +978,7 @@ class Config(object):
             Level of verbosity.
         """
         return self._cfg.get("verbose", 1)
-    
+
     @property
     def early_stopping(self) -> bool:
         """Whether to use early stopping. Defaults to False if not set."""
@@ -956,13 +995,13 @@ class Config(object):
         """Number of epochs with no improvement before stopping."""
         if self.early_stopping:
             return self._get_value_verbose("patience_early_stopping")
-        
+
     @property
     def minimum_epochs_before_early_stopping(self) -> int:
         """Minimum number of epochs before early stopping can be triggered."""
         if self.early_stopping:
             return self._get_value_verbose("minimum_epochs_before_early_stopping")
-    
+
     @property
     def dynamic_learning_rate(self) -> bool:
         """Whether to use  dynamic learning rate. Defaults to False if not set."""
@@ -973,19 +1012,19 @@ class Config(object):
                 "Set validate_every=1 in the config to use early stopping."
             )
         return early_stopping
-    
+
     @property
     def patience_dynamic_learning_rate(self) -> int:
         """Number of epochs with no improvement before reducing learning rate."""
         if self.dynamic_learning_rate:
             return self._get_value_verbose("patience_dynamic_learning_rate")
-        
+
     @property
     def factor_dynamic_learning_rate(self) -> float:
         """Factor by which to reduce learning rate."""
         if self.dynamic_learning_rate:
             return self._get_value_verbose("factor_dynamic_learning_rate")
-    
+
     def _get_embedding_spec(self, embedding_spec: dict) -> dict:
         if isinstance(embedding_spec, bool) and embedding_spec:  #
             msg = [
@@ -1011,19 +1050,19 @@ class Config(object):
     @property
     def xlstm_num_blocks(self) -> int:
         return self._cfg.get("xlstm_num_blocks", 2)
-    
+
     @property
     def xlstm_slstm_at(self) -> List[int]:
         return self._as_default_list(self._cfg.get("xlstm_slstm_at", [1]))
-    
+
     @property
     def xlstm_heads(self) -> int:
         return self._cfg.get("xlstm_heads", 1)
-    
+
     @property
     def xlstm_kernel_size(self) -> int:
         return self._cfg.get("xlstm_kernel_size", 4)
-    
+
     @property
     def xlstm_proj_factor(self) -> float:
         return self._cfg.get("xlstm_proj_factor", 1.3)
