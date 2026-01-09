@@ -36,9 +36,20 @@ hidden_size: 256
 initial_forget_bias: 3
 output_dropout: 0.4
 
+# --- Persistent LSTM behavior ---------------------------------------------------------------------
 # turn on persistent behavior in BaseTrainer
 persistent_state: true
+
+# Supervisor workflow: per-basin (h,c) saved to disk and reloaded for SAME basin next epoch
+persist_state_across_epochs: true          # enables save/load across epochs
+shuffle_basins_each_epoch: true            # changes basin order between epochs (time order inside basin stays fixed)
+persistent_state_dir: persistent_states    # folder inside run_dir where basin state files are stored
+
+# Optional: let tester warm-start each basin from those saved states (READ ONLY)
+use_persistent_state_files_in_eval: true
+
 nan_handling_method: masked
+
 # --- Training configuration -----------------------------------------------------------------------
 optimizer: Adam
 loss: MSE
@@ -70,9 +81,10 @@ dynamic_inputs:
   - temperature
 target_variables:
   - qobs_mm_per_hour
-static_attributes:            
+static_attributes:
   - elev_mean
   - slope_mean
+
 # --- Persistent sampling configuration ------------------------------------------------------------
 non_overlapping_sequences: true
 seq_stride: *SEQ
