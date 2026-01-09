@@ -67,11 +67,22 @@ class BaseTester(object):
         # ------------------------------
         # Persistent eval state (mirror training)
         # ------------------------------
-        self._persistent_hidden_eval = None
+        self._persistent_hidden_eval: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._current_basin_idx_eval = None
 
         # Default behavior inside tester (NO YAML key needed):
         self._persistent_eval_reset_mode = "per_basin"  # {"per_basin", "start"}
+
+        # ------------------------------
+        # MOD: optional warm-start from per-basin saved state files (READ ONLY)
+        # This makes tester consistent with your "save state per basin to file" workflow.
+        # ------------------------------
+        self.use_persistent_state_files_in_eval = getattr(self.cfg, "use_persistent_state_files_in_eval", False)
+
+        state_dir_cfg = getattr(self.cfg, "persistent_state_dir", "persistent_states")
+        # Training wrote these into run_dir/<run_name>/persistent_states by default.
+        # Here run_dir is the same run directory, so this resolves correctly.
+        self.persistent_state_dir = (self.run_dir / state_dir_cfg).resolve()
 
         self._load_run_data()
 
@@ -189,6 +200,23 @@ class BaseTester(object):
             f"Persistent eval: unexpected basin_idx shape {tuple(bidx.shape)}; expected [B] or [B,L]."
         )
 
+    # ================= MOD: per-basin state file load (READ ONLY) =================
+    def _state_file_for_basin(self, basin: str) -> Path:
+        safe = str(basin).replace("/", "_")
+        return self.persistent_state_dir / f"{safe}.pt"
+
+    def _load_basin_state(self, basin: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Load (h,c) for basin from disk. Returns None if missing."""
+        f = self._state_file_for_basin(basin)
+        if not f.exists():
+            return None
+        obj = torch.load(str(f), map_location="cpu")
+        if not isinstance(obj, dict) or ("h" not in obj) or ("c" not in obj):
+            raise RuntimeError(f"Persistent eval: invalid state file format: {f}")
+        h = obj["h"].to(self.device)
+        c = obj["c"].to(self.device)
+        return (h, c)
+
     def evaluate(
         self,
         epoch: int = None,
@@ -206,7 +234,7 @@ class BaseTester(object):
             else:
                 raise RuntimeError("No model was initialized for the evaluation")
 
-        basins = self.basins
+        basins = list(self.basins)
         if self.period == "validation":
             if len(basins) > self.cfg.validate_n_random_basins:
                 random.shuffle(basins)
@@ -217,6 +245,7 @@ class BaseTester(object):
         else:
             model.eval()
 
+        # If reset mode is "start", reset once before whole evaluation
         if self._persistent_eval_reset_mode == "start":
             self._persistent_hidden_eval = None
             self._current_basin_idx_eval = None
@@ -228,8 +257,28 @@ class BaseTester(object):
         pbar.set_description("# Validation" if self.period == "validation" else "# Evaluation")
 
         for basin in pbar:
+            # Default reset per basin if enabled
             if self._persistent_eval_reset_mode == "per_basin":
                 self._persistent_hidden_eval = None
+                self._current_basin_idx_eval = None
+
+            # ------------------------------
+            # MOD: Warm-start persistent hidden state from per-basin state file (READ ONLY)
+            # This is ONLY applied if:
+            #  - model is persistentlstm
+            #  - cfg.persistent_state is True
+            #  - use_persistent_state_files_in_eval is True
+            # ------------------------------
+            if (
+                self.use_persistent_state_files_in_eval
+                and getattr(self.cfg, "persistent_state", False)
+                and self.cfg.model.lower() == "persistentlstm"
+            ):
+                try:
+                    loaded = self._load_basin_state(basin)
+                except Exception as e:
+                    raise RuntimeError(f"Persistent eval: failed to load state for basin={basin}: {e}")
+                self._persistent_hidden_eval = loaded  # can be None if file missing
                 self._current_basin_idx_eval = None
 
             if self.cfg.cache_validation_data and basin in self.cached_datasets.keys():
@@ -603,7 +652,10 @@ class BaseTester(object):
     def _evaluate_persistent_mirror_training(
         self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False
     ):
-        """Mirror BaseTrainer persistent logic, INCLUDING static attributes slicing."""
+        """Mirror BaseTrainer persistent logic, INCLUDING static attributes slicing.
+        MOD NOTE: This function already uses `self._persistent_hidden_eval` as the starting hidden.
+        Now `evaluate()` can set `_persistent_hidden_eval` from per-basin state files before calling this.
+        """
         freq = frequencies[0]
         predict_last_n = self.cfg.predict_last_n
         if isinstance(predict_last_n, int):
@@ -691,7 +743,6 @@ class BaseTester(object):
                         try:
                             orig_b = self._resolve_batch_row_for_basin(data, basin_id_this_seg, B)
                         except Exception:
-                            # fallback mapping (only if basin_idx isn't [B] or unexpected)
                             seg_start = int(seg_slice.start)
                             orig_b = seg_start // L
 
@@ -702,10 +753,10 @@ class BaseTester(object):
                                 else:
                                     seg_data[sk] = sv[orig_b:orig_b + 1, ...]
 
-                    # reset logic
+                    # reset logic (kept as-is)
                     if i_seg == 0:
                         if self._current_basin_idx_eval is None or basin_id_this_seg != self._current_basin_idx_eval:
-                            hidden = None
+                            hidden = hidden  # keep loaded state if any
                     else:
                         if prev_basin_id is not None and basin_id_this_seg != prev_basin_id:
                             hidden = None
