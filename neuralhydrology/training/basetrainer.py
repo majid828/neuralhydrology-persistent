@@ -59,7 +59,7 @@ class BaseTrainer(object):
         self.persistent_state = getattr(self.cfg, "persistent_state", False)
 
         # --------------------------------------------------
-        # MOD: Supervisor idea (the real one you described)
+        
         # --------------------------------------------------
         # If enabled, we save (h,c) per basin to disk and reload it next epoch.
         self.persist_state_across_epochs = getattr(self.cfg, "persist_state_across_epochs", False)
@@ -465,7 +465,7 @@ class BaseTrainer(object):
                     seg_data = self._slice_time_segment(reshaped_data, seg_slice)
 
                     # --------------------------------------------------
-                    # ✅ CRITICAL FIX FOR YOUR ERROR:
+                    # CRITICAL FIX FOR OUR ERROR:
                     # Ensure static attributes have batch=1 to match flattened dynamics batch=1.
                     # Without this, InputLayer torch.cat() fails with "Expected size 1 but got 64".
                     # --------------------------------------------------
