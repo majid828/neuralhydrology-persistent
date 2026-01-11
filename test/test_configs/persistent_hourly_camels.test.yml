@@ -40,7 +40,7 @@ output_dropout: 0.4
 # turn on persistent behavior in BaseTrainer
 persistent_state: true
 
-# Supervisor workflow: per-basin (h,c) saved to disk and reloaded for SAME basin next epoch
+# per-basin (h,c) saved to disk and reloaded for SAME basin next epoch
 persist_state_across_epochs: true          # enables save/load across epochs
 shuffle_basins_each_epoch: true            # changes basin order between epochs (time order inside basin stays fixed)
 persistent_state_dir: persistent_states    # folder inside run_dir where basin state files are stored
