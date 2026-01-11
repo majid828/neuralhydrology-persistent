@@ -34,13 +34,13 @@ output_activation: linear
 
 hidden_size: 256
 initial_forget_bias: 3
-output_dropout: 0.4
+output_dropout: 0.25
 
 # --- Persistent LSTM behavior ---------------------------------------------------------------------
 # turn on persistent behavior in BaseTrainer
 persistent_state: true
 
-# per-basin (h,c) saved to disk and reloaded for SAME basin next epoch
+# Supervisor workflow: per-basin (h,c) saved to disk and reloaded for SAME basin next epoch
 persist_state_across_epochs: true          # enables save/load across epochs
 shuffle_basins_each_epoch: true            # changes basin order between epochs (time order inside basin stays fixed)
 persistent_state_dir: persistent_states    # folder inside run_dir where basin state files are stored
@@ -55,11 +55,15 @@ optimizer: Adam
 loss: MSE
 learning_rate:
   0: 1e-3
-  10: 5e-4
+  10: 1e-4
   20: 1e-4
+  30: 9e-5
+  40: 8e-5
+  50: 7e-5
+  60: 6e-5
 
-batch_size: 64
-epochs: 50
+batch_size: 32
+epochs: 60
 clip_gradient_norm: 1
 
 seq_length: &SEQ 2
