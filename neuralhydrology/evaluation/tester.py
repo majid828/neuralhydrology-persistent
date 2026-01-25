@@ -5,7 +5,7 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -16,7 +16,12 @@ from tqdm import tqdm
 
 from neuralhydrology.datasetzoo import get_dataset
 from neuralhydrology.datasetzoo.basedataset import BaseDataset
-from neuralhydrology.datautils.utils import get_frequency_factor, load_basin_file, load_scaler, sort_frequencies
+from neuralhydrology.datautils.utils import (
+    get_frequency_factor,
+    load_basin_file,
+    load_scaler,
+    sort_frequencies,
+)
 from neuralhydrology.evaluation import plots
 from neuralhydrology.evaluation.metrics import calculate_metrics, get_available_metrics
 from neuralhydrology.evaluation.utils import load_basin_id_encoding, metrics_to_dataframe
@@ -64,25 +69,8 @@ class BaseTester(object):
         self.loss_obj = get_loss_obj(cfg)
         self.loss_obj.set_regularization_terms(get_regularization_obj(cfg=self.cfg))
 
-        # ------------------------------
-        # Persistent eval state (mirror training)
-        # ------------------------------
+        # persistent hidden for evaluation (reset per basin)
         self._persistent_hidden_eval: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self._current_basin_idx_eval = None
-
-        # Default behavior inside tester (NO YAML key needed):
-        self._persistent_eval_reset_mode = "per_basin"  # {"per_basin", "start"}
-
-        # ------------------------------
-        # MOD: optional warm-start from per-basin saved state files (READ ONLY)
-        # This makes tester consistent with your "save state per basin to file" workflow.
-        # ------------------------------
-        self.use_persistent_state_files_in_eval = getattr(self.cfg, "use_persistent_state_files_in_eval", False)
-
-        state_dir_cfg = getattr(self.cfg, "persistent_state_dir", "persistent_states")
-        # Training wrote these into run_dir/<run_name>/persistent_states by default.
-        # Here run_dir is the same run directory, so this resolves correctly.
-        self.persistent_state_dir = (self.run_dir / state_dir_cfg).resolve()
 
         self._load_run_data()
 
@@ -150,7 +138,72 @@ class BaseTester(object):
         )
         return ds
 
-    # ================= MOD: persistent-continuous detection helper =================
+    # ------------------------------------------------------------------
+    # Chronological loader inside a basin (for persistent eval)
+    # IMPORTANT: drop_last=True to match your basetrainer sampler.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _safe_to_numpy(x: Any) -> np.ndarray:
+        if isinstance(x, np.ndarray):
+            return x
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.array(x)
+
+    def _infer_sample_start_time(self, sample: Dict[str, object]) -> Optional[np.int64]:
+        if "date" in sample:
+            try:
+                d = self._safe_to_numpy(sample["date"]).reshape(-1)[0]
+                if np.issubdtype(np.array(d).dtype, np.datetime64):
+                    return np.array(d).astype("datetime64[s]").astype(np.int64)
+                return np.int64(d)
+            except Exception:
+                return None
+        return None
+
+    def _get_chrono_loader(self, ds: BaseDataset) -> DataLoader:
+        n = len(ds)
+        if n == 0:
+            return DataLoader(ds, batch_size=self.cfg.batch_size, num_workers=0, collate_fn=ds.collate_fn)
+
+        items: List[Tuple[int, Union[int, np.int64]]] = []
+        for i in range(n):
+            sample = ds[i]
+            t0 = self._infer_sample_start_time(sample)
+            if t0 is None:
+                t0 = np.int64(i)
+            items.append((i, t0))
+
+        items_sorted = sorted(items, key=lambda x: x[1])
+        sorted_indices = [i for i, _ in items_sorted]
+
+        batch_size = int(self.cfg.batch_size)
+        batches = [sorted_indices[i: i + batch_size] for i in range(0, len(sorted_indices), batch_size)]
+        # MATCH TRAINING: drop_last=True
+        batches = [b for b in batches if len(b) == batch_size]
+
+        class _ListBatchSampler(torch.utils.data.Sampler):
+            def __init__(self, batches_):
+                self.batches_ = batches_
+
+            def __iter__(self):
+                yield from self.batches_
+
+            def __len__(self):
+                return len(self.batches_)
+
+        return DataLoader(ds, batch_sampler=_ListBatchSampler(batches), num_workers=0, collate_fn=ds.collate_fn)
+
+    # ------------------------------------------------------------------
+    # Persistent switches
+    # ------------------------------------------------------------------
+    def _is_persistent_mirror_eval(self, frequencies: List[str]) -> bool:
+        return (
+            getattr(self.cfg, "persistent_state", False)
+            and self.cfg.model.lower() == "persistentlstm"
+            and len(frequencies) == 1
+        )
+
     def _is_persistent_continuous_eval(self, frequencies: List[str]) -> bool:
         if not getattr(self.cfg, "persistent_state", False):
             return False
@@ -170,53 +223,45 @@ class BaseTester(object):
 
         return seq_stride in (1, seq_length)
 
-    # ================= STATIC: robust basin->batch-row mapping (match BaseTrainer) =================
+    # ------------------------------------------------------------------
+    # SAME flatten utilities as your BaseTrainer
+    # ------------------------------------------------------------------
     @staticmethod
-    def _resolve_batch_row_for_basin(data: Dict[str, object], basin_id: int, B_expected: int) -> int:
-        """Find which original batch row corresponds to `basin_id` (robust).
-        Prefers data['basin_idx'] if it is [B]. Falls back to mapping via [B,L] if present.
-        """
-        if "basin_idx" not in data or (not torch.is_tensor(data["basin_idx"])):
-            raise RuntimeError("Persistent eval: basin_idx missing from batch; cannot map static features.")
+    def _flatten_time_batch(t: torch.Tensor) -> torch.Tensor:
+        """Flatten [B, L, ...] -> [1, B*L, ...]."""
+        if not torch.is_tensor(t) or t.dim() < 2:
+            return t
+        t = t.contiguous()
+        b, l = t.shape[0], t.shape[1]
+        return t.view(1, b * l, *t.shape[2:])
 
-        bidx = data["basin_idx"]
+    def _slice_time_segment(self, data_dict: Dict[str, object], segment_slice: slice) -> Dict[str, object]:
+        """Slice time segment from already reshaped tensors (expects [1, T, ...])."""
+        seg = {}
+        for key, val in data_dict.items():
+            if key.startswith("x_d"):
+                seg[key] = {feat: v[:, segment_slice, ...] for feat, v in val.items()}
+            elif key.startswith("x_s"):
+                seg[key] = val
+            elif key.startswith("y") or key.startswith("basin_idx"):
+                if torch.is_tensor(val):
+                    if val.dim() == 1:
+                        seg[key] = val[segment_slice]
+                    else:
+                        seg[key] = val[:, segment_slice, ...]
+                else:
+                    seg[key] = val
+            elif key.startswith("date"):
+                seg[key] = val
+            elif torch.is_tensor(val) and val.dim() >= 2:
+                seg[key] = val[:, segment_slice, ...]
+            else:
+                seg[key] = val
+        return seg
 
-        # Common NH case: basin_idx is [B]
-        if bidx.dim() == 1 and int(bidx.shape[0]) == int(B_expected):
-            matches = (bidx == basin_id).nonzero(as_tuple=True)[0]
-            if matches.numel() == 0:
-                raise RuntimeError(f"Persistent eval: basin {basin_id} not found in batch basin_idx.")
-            return int(matches[0].item())
-
-        # Sometimes basin_idx might already be [B,L]
-        if bidx.dim() == 2 and int(bidx.shape[0]) == int(B_expected):
-            row_ids = bidx[:, 0]
-            matches = (row_ids == basin_id).nonzero(as_tuple=True)[0]
-            if matches.numel() == 0:
-                raise RuntimeError(f"Persistent eval: basin {basin_id} not found in batch basin_idx[:,0].")
-            return int(matches[0].item())
-
-        raise RuntimeError(
-            f"Persistent eval: unexpected basin_idx shape {tuple(bidx.shape)}; expected [B] or [B,L]."
-        )
-
-    # ================= MOD: per-basin state file load (READ ONLY) =================
-    def _state_file_for_basin(self, basin: str) -> Path:
-        safe = str(basin).replace("/", "_")
-        return self.persistent_state_dir / f"{safe}.pt"
-
-    def _load_basin_state(self, basin: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Load (h,c) for basin from disk. Returns None if missing."""
-        f = self._state_file_for_basin(basin)
-        if not f.exists():
-            return None
-        obj = torch.load(str(f), map_location="cpu")
-        if not isinstance(obj, dict) or ("h" not in obj) or ("c" not in obj):
-            raise RuntimeError(f"Persistent eval: invalid state file format: {f}")
-        h = obj["h"].to(self.device)
-        c = obj["c"].to(self.device)
-        return (h, c)
-
+    # ------------------------------------------------------------------
+    # Evaluate
+    # ------------------------------------------------------------------
     def evaluate(
         self,
         epoch: int = None,
@@ -226,7 +271,6 @@ class BaseTester(object):
         model: torch.nn.Module = None,
         experiment_logger: Logger = None,
     ) -> dict:
-        """Evaluate the model."""
         if model is None:
             if self.init_model:
                 self._load_weights(epoch=epoch)
@@ -245,11 +289,6 @@ class BaseTester(object):
         else:
             model.eval()
 
-        # If reset mode is "start", reset once before whole evaluation
-        if self._persistent_eval_reset_mode == "start":
-            self._persistent_hidden_eval = None
-            self._current_basin_idx_eval = None
-
         results = defaultdict(dict)
         all_output = {basin: None for basin in basins}
 
@@ -257,29 +296,8 @@ class BaseTester(object):
         pbar.set_description("# Validation" if self.period == "validation" else "# Evaluation")
 
         for basin in pbar:
-            # Default reset per basin if enabled
-            if self._persistent_eval_reset_mode == "per_basin":
-                self._persistent_hidden_eval = None
-                self._current_basin_idx_eval = None
-
-            # ------------------------------
-            # MOD: Warm-start persistent hidden state from per-basin state file (READ ONLY)
-            # This is ONLY applied if:
-            #  - model is persistentlstm
-            #  - cfg.persistent_state is True
-            #  - use_persistent_state_files_in_eval is True
-            # ------------------------------
-            if (
-                self.use_persistent_state_files_in_eval
-                and getattr(self.cfg, "persistent_state", False)
-                and self.cfg.model.lower() == "persistentlstm"
-            ):
-                try:
-                    loaded = self._load_basin_state(basin)
-                except Exception as e:
-                    raise RuntimeError(f"Persistent eval: failed to load state for basin={basin}: {e}")
-                self._persistent_hidden_eval = loaded  # can be None if file missing
-                self._current_basin_idx_eval = None
+            # reset hidden per basin (no leakage across basins)
+            self._persistent_hidden_eval = None
 
             if self.cfg.cache_validation_data and basin in self.cached_datasets.keys():
                 ds = self.cached_datasets[basin]
@@ -291,7 +309,7 @@ class BaseTester(object):
                 if self.cfg.cache_validation_data and self.period == "validation":
                     self.cached_datasets[basin] = ds
 
-            loader = DataLoader(ds, batch_size=self.cfg.batch_size, num_workers=0, collate_fn=ds.collate_fn)
+            loader = self._get_chrono_loader(ds)
 
             y_hat, y, dates, mean_losses, all_output[basin] = self._evaluate(
                 model, loader, ds.frequencies, save_all_output
@@ -389,6 +407,7 @@ class BaseTester(object):
 
                     continue
 
+                # original NH xarray path
                 data_vars = self._create_xarray_data_vars(y_hat_freq, y_freq)
                 frequency_factor = int(get_frequency_factor(lowest_freq, freq))
 
@@ -482,6 +501,214 @@ class BaseTester(object):
 
         return results
 
+    # ------------------------------------------------------------------
+    # Core _evaluate()
+    # ------------------------------------------------------------------
+    def _evaluate(self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False):
+        if self._is_persistent_mirror_eval(frequencies):
+            return self._evaluate_persistent_match_training_with_flatten(model, loader, frequencies, save_all_output)
+
+        # original NH non-persistent path
+        predict_last_n = self.cfg.predict_last_n
+        if isinstance(predict_last_n, int):
+            predict_last_n = {frequencies[0]: predict_last_n}
+
+        preds, obs, dates, all_output = {}, {}, {}, {}
+        losses = []
+
+        with torch.no_grad():
+            for data in loader:
+                for key in data:
+                    if key.startswith("x_d"):
+                        data[key] = {k: v.to(self.device) for k, v in data[key].items()}
+                    elif not key.startswith("date"):
+                        data[key] = data[key].to(self.device)
+
+                data = model.pre_model_hook(data, is_train=False)
+                predictions = model(data)
+                _, all_losses = self.loss_obj(predictions, data)
+                losses.append({k: v.item() for k, v in all_losses.items()})
+
+                if all_output:
+                    for key, value in predictions.items():
+                        if value is not None and type(value) != dict:
+                            all_output[key].append(value.detach().cpu().numpy())
+                elif save_all_output:
+                    all_output = {
+                        key: [value.detach().cpu().numpy()]
+                        for key, value in predictions.items()
+                        if value is not None and type(value) != dict
+                    }
+
+                for freq in frequencies:
+                    if predict_last_n[freq] == 0:
+                        continue
+                    freq_key = "" if len(frequencies) == 1 else f"_{freq}"
+                    y_hat_sub, y_sub = self._subset_targets(model, data, predictions, predict_last_n[freq], freq_key)
+                    date_sub = data[f"date{freq_key}"][:, -predict_last_n[freq]:]
+
+                    if freq not in preds:
+                        preds[freq] = y_hat_sub.detach().cpu()
+                        obs[freq] = y_sub.cpu()
+                        dates[freq] = date_sub
+                    else:
+                        preds[freq] = torch.cat((preds[freq], y_hat_sub.detach().cpu()), 0)
+                        obs[freq] = torch.cat((obs[freq], y_sub.detach().cpu()), 0)
+                        dates[freq] = np.concatenate((dates[freq], date_sub), axis=0)
+
+            for freq in preds.keys():
+                preds[freq] = preds[freq].numpy()
+                obs[freq] = obs[freq].numpy()
+
+        for key, list_of_data in all_output.items():
+            all_output[key] = np.concatenate(list_of_data, 0)
+
+        mean_losses = {}
+        if len(losses) == 0:
+            mean_losses["loss"] = np.nan
+        else:
+            for loss_name in losses[0].keys():
+                mean_losses[loss_name] = float(np.nanmean([d[loss_name] for d in losses]))
+
+        return preds, obs, dates, mean_losses, all_output
+
+    # ------------------------------------------------------------------
+    # Persistent eval that MATCHES your BaseTrainer flatten logic
+    # ------------------------------------------------------------------
+    def _evaluate_persistent_match_training_with_flatten(
+        self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False
+    ):
+        freq = frequencies[0]
+        predict_last_n = self.cfg.predict_last_n
+        if isinstance(predict_last_n, int):
+            predict_last_n = {freq: predict_last_n}
+
+        preds, obs, dates, all_output = {}, {}, {}, {}
+        losses = []
+
+        hidden = self._persistent_hidden_eval  # starts None per basin (set/reset in evaluate())
+
+        with torch.no_grad():
+            for data in loader:
+                # move tensors
+                for key in data.keys():
+                    if key.startswith("x_d"):
+                        data[key] = {k: v.to(self.device) for k, v in data[key].items()}
+                    elif not key.startswith("date"):
+                        data[key] = data[key].to(self.device)
+
+                data = model.pre_model_hook(data, is_train=False)
+
+                # infer B,L from x_d
+                if "x_d" not in data or not isinstance(data["x_d"], dict) or len(data["x_d"]) == 0:
+                    raise RuntimeError("Persistent eval: expected data['x_d'] dict with dynamic inputs.")
+                any_xd = next(iter(data["x_d"].values()))
+                if any_xd.dim() < 2:
+                    raise RuntimeError("Persistent eval: expected x_d tensors with shape [B, L, ...].")
+                B_inferred, L_inferred = int(any_xd.shape[0]), int(any_xd.shape[1])
+
+                # flatten like trainer -> batch=1, time=B*L
+                reshaped: Dict[str, object] = {}
+                for key, val in data.items():
+                    if key.startswith("x_d"):
+                        reshaped[key] = {feat: self._flatten_time_batch(v) for feat, v in val.items()}
+                    elif key.startswith("x_s"):
+                        reshaped[key] = val
+                    elif key.startswith("y") and torch.is_tensor(val):
+                        reshaped[key] = self._flatten_time_batch(val)
+                    elif key == "basin_idx" and torch.is_tensor(val):
+                        if val.dim() == 1:
+                            basin_2d = val.view(B_inferred, 1).expand(B_inferred, L_inferred)
+                        else:
+                            basin_2d = val
+                        reshaped[key] = self._flatten_time_batch(basin_2d)
+                    else:
+                        if torch.is_tensor(val) and val.dim() >= 2:
+                            reshaped[key] = self._flatten_time_batch(val)
+                        else:
+                            reshaped[key] = val
+
+                seg_len = B_inferred * L_inferred
+                seg_data = self._slice_time_segment(reshaped, slice(0, seg_len))
+
+                # force x_s to batch=1 (same as trainer)
+                if "x_s" in data:
+                    if isinstance(data["x_s"], dict):
+                        seg_data["x_s"] = {feat: v[0:1, ...] for feat, v in data["x_s"].items()}
+                    else:
+                        seg_data["x_s"] = data["x_s"][0:1, ...]
+
+                # forward with hidden
+                pred = model(seg_data, hidden_state=hidden)
+
+                # update hidden (shape should remain [layers, 1, H] always)
+                new_hidden = pred.get("hidden_state", None)
+                if new_hidden is not None:
+                    h, c = new_hidden
+                    hidden = (h.detach(), c.detach())
+                else:
+                    hidden = None
+
+                # losses for logging
+                _, all_losses = self.loss_obj(pred, seg_data)
+                losses.append({k: float(v.detach().cpu().item()) for k, v in all_losses.items()})
+
+                # build "full_predictions" back to [B,L,...] for metrics code
+                full_predictions: Dict[str, torch.Tensor] = {}
+                for k, v in pred.items():
+                    if v is None or isinstance(v, dict) or k == "hidden_state":
+                        continue
+                    if not torch.is_tensor(v):
+                        continue
+                    if v.dim() >= 2 and v.shape[0] == 1 and v.shape[1] == seg_len:
+                        full_predictions[k] = v.reshape(B_inferred, L_inferred, *v.shape[2:])
+
+                # optional save_all_output
+                if save_all_output:
+                    if all_output:
+                        for k, v in full_predictions.items():
+                            all_output.setdefault(k, []).append(v.detach().cpu().numpy())
+                    else:
+                        all_output = {k: [v.detach().cpu().numpy()] for k, v in full_predictions.items()}
+
+                # store preds/obs/dates for metrics
+                if predict_last_n[freq] == 0:
+                    continue
+                freq_key = ""
+                y_hat_sub, y_sub = self._subset_targets(model, data, full_predictions, predict_last_n[freq], freq_key)
+                date_sub = data[f"date{freq_key}"][:, -predict_last_n[freq]:]
+
+                if freq not in preds:
+                    preds[freq] = y_hat_sub.detach().cpu()
+                    obs[freq] = y_sub.detach().cpu()
+                    dates[freq] = date_sub
+                else:
+                    preds[freq] = torch.cat((preds[freq], y_hat_sub.detach().cpu()), 0)
+                    obs[freq] = torch.cat((obs[freq], y_sub.detach().cpu()), 0)
+                    dates[freq] = np.concatenate((dates[freq], date_sub), axis=0)
+
+        self._persistent_hidden_eval = hidden
+
+        for f in preds.keys():
+            preds[f] = preds[f].numpy()
+            obs[f] = obs[f].numpy()
+
+        if save_all_output:
+            for k, vlist in all_output.items():
+                all_output[k] = np.concatenate(vlist, axis=0)
+
+        mean_losses = {}
+        if len(losses) == 0:
+            mean_losses["loss"] = np.nan
+        else:
+            for k in losses[0].keys():
+                mean_losses[k] = float(np.nanmean([d[k] for d in losses]))
+
+        return preds, obs, dates, mean_losses, all_output
+
+    # ------------------------------------------------------------------
+    # misc
+    # ------------------------------------------------------------------
     def _create_and_log_figures(self, results: dict, experiment_logger: Logger, epoch: int):
         basins = list(results.keys())
         random.shuffle(basins)
@@ -531,328 +758,6 @@ class BaseTester(object):
             with result_file.open("wb") as fp:
                 pickle.dump(states, fp)
             LOGGER.info(f"Stored states at {result_file}")
-
-    # ------------------------------------------------------------------
-    # Persistent helpers (mirror BaseTrainer)
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _flatten_time_batch(t: torch.Tensor) -> torch.Tensor:
-        """Flatten [B, L, ...] → [1, B*L, ...] (match BaseTrainer)"""
-        if (not torch.is_tensor(t)) or t.dim() < 2:
-            return t
-        t = t.contiguous()
-        b, l = t.shape[0], t.shape[1]
-        return t.view(1, b * l, *t.shape[2:])
-
-    def _slice_time_segment(self, data_dict: Dict[str, object], segment_slice: slice) -> Dict[str, object]:
-        """Slice a contiguous segment from reshaped data (expects time-like tensors as [1, L_new, ...])."""
-        seg = {}
-        for key, val in data_dict.items():
-            if key.startswith("x_d"):
-                seg[key] = {feat: v[:, segment_slice, ...] for feat, v in val.items()}
-            elif key.startswith("x_s"):
-                seg[key] = val  # overwritten per segment below
-            elif key.startswith("y") or key.startswith("basin_idx"):
-                if torch.is_tensor(val):
-                    if val.dim() == 1:
-                        seg[key] = val[segment_slice]
-                    else:
-                        seg[key] = val[:, segment_slice, ...]
-                else:
-                    seg[key] = val
-            elif key.startswith("date"):
-                seg[key] = val
-            elif torch.is_tensor(val) and val.dim() >= 2:
-                seg[key] = val[:, segment_slice, ...]
-            else:
-                seg[key] = val
-        return seg
-
-    def _is_persistent_mirror_eval(self, frequencies: List[str]) -> bool:
-        return (
-            getattr(self.cfg, "persistent_state", False)
-            and self.cfg.model.lower() == "persistentlstm"
-            and len(frequencies) == 1
-        )
-
-    # ------------------------------------------------------------------
-    # EVALUATION CORE
-    # ------------------------------------------------------------------
-    def _evaluate(self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False):
-        """Evaluate model."""
-        if self._is_persistent_mirror_eval(frequencies):
-            return self._evaluate_persistent_mirror_training(model, loader, frequencies, save_all_output)
-
-        # ---------------- ORIGINAL (non-persistent) BEHAVIOR ----------------
-        predict_last_n = self.cfg.predict_last_n
-        if isinstance(predict_last_n, int):
-            predict_last_n = {frequencies[0]: predict_last_n}
-
-        preds, obs, dates, all_output = {}, {}, {}, {}
-        losses = []
-
-        with torch.no_grad():
-            for data in loader:
-                for key in data:
-                    if key.startswith("x_d"):
-                        data[key] = {k: v.to(self.device) for k, v in data[key].items()}
-                    elif not key.startswith("date"):
-                        data[key] = data[key].to(self.device)
-
-                data = model.pre_model_hook(data, is_train=False)
-                predictions, loss = self._get_predictions_and_loss(model, data)
-
-                if all_output:
-                    for key, value in predictions.items():
-                        if value is not None and type(value) != dict:
-                            all_output[key].append(value.detach().cpu().numpy())
-                elif save_all_output:
-                    all_output = {
-                        key: [value.detach().cpu().numpy()]
-                        for key, value in predictions.items()
-                        if value is not None and type(value) != dict
-                    }
-
-                for freq in frequencies:
-                    if predict_last_n[freq] == 0:
-                        continue
-                    freq_key = "" if len(frequencies) == 1 else f"_{freq}"
-                    y_hat_sub, y_sub = self._subset_targets(model, data, predictions, predict_last_n[freq], freq_key)
-                    date_sub = data[f"date{freq_key}"][:, -predict_last_n[freq] :]
-
-                    if freq not in preds:
-                        preds[freq] = y_hat_sub.detach().cpu()
-                        obs[freq] = y_sub.cpu()
-                        dates[freq] = date_sub
-                    else:
-                        preds[freq] = torch.cat((preds[freq], y_hat_sub.detach().cpu()), 0)
-                        obs[freq] = torch.cat((obs[freq], y_sub.detach().cpu()), 0)
-                        dates[freq] = np.concatenate((dates[freq], date_sub), axis=0)
-
-                losses.append(loss)
-
-            for freq in preds.keys():
-                preds[freq] = preds[freq].numpy()
-                obs[freq] = obs[freq].numpy()
-
-        for key, list_of_data in all_output.items():
-            all_output[key] = np.concatenate(list_of_data, 0)
-
-        mean_losses = {}
-        if len(losses) == 0:
-            mean_losses["loss"] = np.nan
-        else:
-            for loss_name in losses[0].keys():
-                loss_values = [loss[loss_name] for loss in losses]
-                mean_losses[loss_name] = np.nanmean(loss_values) if not np.all(np.isnan(loss_values)) else np.nan
-
-        return preds, obs, dates, mean_losses, all_output
-
-    # ---------------- PERSISTENT MIRROR EVAL ----------------
-    def _evaluate_persistent_mirror_training(
-        self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False
-    ):
-        """Mirror BaseTrainer persistent logic, INCLUDING static attributes slicing.
-        MOD NOTE: This function already uses `self._persistent_hidden_eval` as the starting hidden.
-        Now `evaluate()` can set `_persistent_hidden_eval` from per-basin state files before calling this.
-        """
-        freq = frequencies[0]
-        predict_last_n = self.cfg.predict_last_n
-        if isinstance(predict_last_n, int):
-            predict_last_n = {freq: predict_last_n}
-
-        preds, obs, dates, all_output = {}, {}, {}, {}
-
-        loss_sum: Dict[str, float] = {}
-        loss_w: Dict[str, int] = {}
-
-        with torch.no_grad():
-            for data in loader:
-                for key in data.keys():
-                    if key.startswith("x_d"):
-                        data[key] = {k: v.to(self.device) for k, v in data[key].items()}
-                    elif not key.startswith("date"):
-                        data[key] = data[key].to(self.device)
-
-                data = model.pre_model_hook(data, is_train=False)
-
-                any_xd = None
-                for k, v in data.items():
-                    if k.startswith("x_d") and isinstance(v, dict) and len(v) > 0:
-                        any_xd = next(iter(v.values()))
-                        break
-                if any_xd is None or any_xd.dim() < 2:
-                    raise RuntimeError("Persistent eval: could not infer [B, L] from x_d.")
-                B, L = int(any_xd.shape[0]), int(any_xd.shape[1])
-
-                reshaped_data: Dict[str, object] = {}
-                for key, val in data.items():
-                    if key.startswith("x_d"):
-                        reshaped_data[key] = {feat: self._flatten_time_batch(v) for feat, v in val.items()}
-                    elif key.startswith("x_s"):
-                        reshaped_data[key] = val  # sliced per segment
-                    elif key.startswith("y"):
-                        reshaped_data[key] = self._flatten_time_batch(val)
-                    elif key.startswith("basin_idx"):
-                        if torch.is_tensor(val) and val.dim() == 1:
-                            basin_2d = val.view(B, 1).expand(B, L)
-                            reshaped_data[key] = self._flatten_time_batch(basin_2d)
-                        else:
-                            reshaped_data[key] = self._flatten_time_batch(val)
-                    else:
-                        if torch.is_tensor(val):
-                            if val.dim() >= 2:
-                                reshaped_data[key] = self._flatten_time_batch(val)
-                            else:
-                                reshaped_data[key] = val.view(1, -1) if val.dim() == 1 else val
-                        else:
-                            reshaped_data[key] = val
-
-                basin_indices_flat = reshaped_data["basin_idx"].view(-1)
-                L_new = basin_indices_flat.size(0)
-                if L_new == 0:
-                    continue
-
-                diff = basin_indices_flat[1:] - basin_indices_flat[:-1]
-                change_points = torch.where(diff != 0)[0] + 1
-
-                segment_slices = []
-                start = 0
-                for cp in change_points:
-                    cp_int = int(cp.item())
-                    segment_slices.append(slice(start, cp_int))
-                    start = cp_int
-                segment_slices.append(slice(start, L_new))
-
-                hidden = self._persistent_hidden_eval
-                prev_basin_id = None
-                stitched: Dict[str, List[torch.Tensor]] = {}
-
-                for i_seg, seg_slice in enumerate(segment_slices):
-                    seg_data = self._slice_time_segment(reshaped_data, seg_slice)
-
-                    seg_basin_ids = seg_data["basin_idx"].view(-1)
-                    basin_id_this_seg = int(seg_basin_ids[0].item())
-                    seg_len = int(seg_basin_ids.numel())
-
-                    # ---------------------------
-                    # STATIC ATTRIBUTES (match BaseTrainer):
-                    # pick correct original batch row for this basin and slice x_s to [1,...]
-                    # ---------------------------
-                    if any(k.startswith("x_s") for k in data.keys()):
-                        try:
-                            orig_b = self._resolve_batch_row_for_basin(data, basin_id_this_seg, B)
-                        except Exception:
-                            seg_start = int(seg_slice.start)
-                            orig_b = seg_start // L
-
-                        for sk, sv in data.items():
-                            if sk.startswith("x_s"):
-                                if isinstance(sv, dict):
-                                    seg_data[sk] = {feat: v[orig_b:orig_b + 1, ...] for feat, v in sv.items()}
-                                else:
-                                    seg_data[sk] = sv[orig_b:orig_b + 1, ...]
-
-                    # reset logic (kept as-is)
-                    if i_seg == 0:
-                        if self._current_basin_idx_eval is None or basin_id_this_seg != self._current_basin_idx_eval:
-                            hidden = hidden  # keep loaded state if any
-                    else:
-                        if prev_basin_id is not None and basin_id_this_seg != prev_basin_id:
-                            hidden = None
-
-                    seg_preds = model(seg_data, hidden_state=hidden)
-
-                    new_hidden = seg_preds.get("hidden_state", None)
-                    if new_hidden is not None:
-                        h, c = new_hidden
-                        hidden = (h.detach(), c.detach())
-                    else:
-                        hidden = None
-
-                    _, seg_all_losses = self.loss_obj(seg_preds, seg_data)
-
-                    for k, v in seg_all_losses.items():
-                        v_item = float(v.detach().cpu().item()) if torch.is_tensor(v) else float(v)
-                        if np.isfinite(v_item):
-                            loss_sum[k] = loss_sum.get(k, 0.0) + v_item * seg_len
-                            loss_w[k] = loss_w.get(k, 0) + seg_len
-
-                    for k, v in seg_preds.items():
-                        if v is None or isinstance(v, dict):
-                            continue
-                        if k == "hidden_state":
-                            continue
-                        if not torch.is_tensor(v):
-                            continue
-
-                        v_norm = None
-                        if v.dim() >= 2 and v.shape[0] == 1 and v.shape[1] == seg_len:
-                            v_norm = v
-                        elif v.dim() >= 1 and v.shape[0] == seg_len:
-                            v_norm = v.unsqueeze(0)
-                        else:
-                            continue
-
-                        stitched.setdefault(k, []).append(v_norm.detach())
-
-                    prev_basin_id = basin_id_this_seg
-
-                self._persistent_hidden_eval = hidden
-                self._current_basin_idx_eval = prev_basin_id
-
-                full_predictions: Dict[str, torch.Tensor] = {}
-                for k, parts in stitched.items():
-                    flat = torch.cat(parts, dim=1)  # [1, B*L, ...]
-                    if flat.shape[1] != B * L:
-                        raise RuntimeError(
-                            f"Persistent eval stitch mismatch for key={k}: got {flat.shape[1]} steps, expected {B*L}."
-                        )
-                    new_shape = (B, L) + tuple(flat.shape[2:])
-                    full_predictions[k] = flat.reshape(*new_shape)
-
-                if all_output:
-                    for key, value in full_predictions.items():
-                        all_output[key].append(value.detach().cpu().numpy())
-                elif save_all_output:
-                    all_output = {key: [value.detach().cpu().numpy()] for key, value in full_predictions.items()}
-
-                if predict_last_n[freq] == 0:
-                    continue
-
-                freq_key = ""
-                y_hat_sub, y_sub = self._subset_targets(model, data, full_predictions, predict_last_n[freq], freq_key)
-                date_sub = data[f"date{freq_key}"][:, -predict_last_n[freq] :]
-
-                if freq not in preds:
-                    preds[freq] = y_hat_sub.detach().cpu()
-                    obs[freq] = y_sub.detach().cpu()
-                    dates[freq] = date_sub
-                else:
-                    preds[freq] = torch.cat((preds[freq], y_hat_sub.detach().cpu()), 0)
-                    obs[freq] = torch.cat((obs[freq], y_sub.detach().cpu()), 0)
-                    dates[freq] = np.concatenate((dates[freq], date_sub), axis=0)
-
-        for f in preds.keys():
-            preds[f] = preds[f].numpy()
-            obs[f] = obs[f].numpy()
-
-        for key, list_of_data in all_output.items():
-            all_output[key] = np.concatenate(list_of_data, 0)
-
-        mean_losses = {}
-        if len(loss_sum) == 0:
-            mean_losses["loss"] = np.nan
-        else:
-            for k in loss_sum.keys():
-                mean_losses[k] = (loss_sum[k] / loss_w[k]) if loss_w.get(k, 0) > 0 else np.nan
-
-        return preds, obs, dates, mean_losses, all_output
-
-    def _get_predictions_and_loss(self, model: BaseModel, data: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, float]:
-        predictions = model(data)
-        _, all_losses = self.loss_obj(predictions, data)
-        return predictions, {k: v.item() for k, v in all_losses.items()}
 
     def _subset_targets(
         self, model: BaseModel, data: Dict[str, torch.Tensor], predictions: dict, predict_last_n: int, freq: str
