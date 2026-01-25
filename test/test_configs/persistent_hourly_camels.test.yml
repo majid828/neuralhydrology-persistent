@@ -1,6 +1,7 @@
 # --- Experiment configurations --------------------------------------------------------------------
 experiment_name: persistent_hourly_test
 
+# leave empty/null to let NH create runs/<experiment_name>_timestamp automatically
 run_dir:
 
 train_basin_file: ./test/test_data/4_basins_test_set.txt
@@ -34,19 +35,11 @@ output_activation: linear
 
 hidden_size: 256
 initial_forget_bias: 3
-output_dropout: 0.25
+output_dropout: 0.3   # reduced (0.4 often hurts)
 
 # --- Persistent LSTM behavior ---------------------------------------------------------------------
-# turn on persistent behavior in BaseTrainer
+# USED by your BaseTrainer to switch to BasinChronoInterleaveBatchSampler + epoch-local state cache
 persistent_state: true
-
-# Supervisor workflow: per-basin (h,c) saved to disk and reloaded for SAME basin next epoch
-persist_state_across_epochs: true          # enables save/load across epochs
-shuffle_basins_each_epoch: true            # changes basin order between epochs (time order inside basin stays fixed)
-persistent_state_dir: persistent_states    # folder inside run_dir where basin state files are stored
-
-# Optional: let tester warm-start each basin from those saved states (READ ONLY)
-use_persistent_state_files_in_eval: true
 
 nan_handling_method: masked
 
@@ -57,15 +50,12 @@ learning_rate:
   0: 1e-3
   10: 1e-4
   20: 1e-4
-  30: 9e-5
-  40: 8e-5
-  50: 7e-5
-  60: 6e-5
 
-batch_size: 32
+batch_size: 64
 epochs: 60
 clip_gradient_norm: 1
 
+# IMPORTANT: give the model temporal context
 seq_length: &SEQ 2
 predict_last_n: *SEQ
 
@@ -90,5 +80,6 @@ static_attributes:
   - slope_mean
 
 # --- Persistent sampling configuration ------------------------------------------------------------
+# If you want strict non-overlapping time blocks (good for persistent hidden state logic)
 non_overlapping_sequences: true
 seq_stride: *SEQ
