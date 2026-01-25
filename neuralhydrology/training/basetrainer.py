@@ -27,14 +27,14 @@ LOGGER = logging.getLogger(__name__)
 
 
 # =============================================================================
-# FIXED: BasinChronoInterleaveBatchSampler
+# FIXED: Basin Chrono Interleave Batch Sampler
 # =============================================================================
 class BasinChronoInterleaveBatchSampler(Sampler[List[int]]):
     """
-    Correct sampler for *within-epoch* persistent hidden state.
+   
 
-    What we want (and what this sampler guarantees):
-      - Within each basin: batches are always chronological (never A2 before A1).
+    
+      - Within each basin: batches are always chronological (never A2(second batch of a basin) before A1(first batch of a basin)).
       - Across basins: we still "shuffle" by randomly interleaving basins
         (A1, C1, B1, A2, D1, B2, ...).
 
@@ -143,7 +143,7 @@ class BaseTrainer(object):
         # Persistent LSTM flag (your control switch)
         self.persistent_state = getattr(self.cfg, "persistent_state", False)
 
-        # NOTE: You said you do NOT want persistence across epochs anymore.
+        # NOTE: we do NOT want persistence across epochs anymore.
         # These are kept only so older configs won't crash, but they are NOT used here.
         self.persist_state_across_epochs = getattr(self.cfg, "persist_state_across_epochs", False)
         self.shuffle_basins_each_epoch = getattr(self.cfg, "shuffle_basins_each_epoch", False)
@@ -242,6 +242,7 @@ class BaseTrainer(object):
 
         This is used by BasinChronoInterleaveBatchSampler so that:
             basin A always yields A1, A2, A3... (chronological)
+            (it should not came in random order like A3, A1, A2...)
         even while basins are interleaved in random order.
         """
         basin_to_items: Dict[int, List[Tuple[int, Any]]] = {}
@@ -471,7 +472,7 @@ class BaseTrainer(object):
         self.experiment_logger.train()
 
         # ============================================================
-        # Persistent path: persist across batches within epoch only
+        # Persistent path: persist across batches of same basin within epoch only
         # ============================================================
         if self.persistent_state and self.cfg.model.lower() == "persistentlstm":
             # Reset all basin states at epoch start (NO cross-epoch persistence)
