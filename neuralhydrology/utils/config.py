@@ -1,34 +1,3 @@
-"""
-neuralhydrology/utils/config.py
-
-This is a drop-in replacement for the original NeuralHydrology Config class,
-updated to support your PersistentLSTM workflow.
-
-WHY YOU GOT THE ERROR:
-- The original Config enforces strict checking: any YAML key must correspond to a @property on Config.
-- Your YAML contains new keys:
-    persist_state_across_epochs
-    shuffle_basins_each_epoch
-    persistent_state_dir
-    use_persistent_state_files_in_eval
-  but the "before changes" config.py did not define properties for them,
-  so _check_cfg_keys() raises ValueError.
-
-WHAT WE CHANGED:
-1) Added @property definitions for the new persistent keys so _check_cfg_keys() accepts them.
-2) Added persistent_state_dir resolution logic:
-   - If YAML gives a relative path, interpret it relative to run_dir (if known) so it lives inside the run folder.
-   - Otherwise fall back to cwd.
-3) Fixed a bug in your "before changes" file:
-   - dynamic_learning_rate property incorrectly returned early_stopping.
-   - Now it correctly reads "dynamic_learning_rate" from YAML.
-4) Kept everything else identical to your original version (as much as possible).
-
-NOTE:
-- This file does NOT change training behavior by itself; it only makes YAML parsing consistent
-  and exposes config values cleanly.
-"""
-
 import itertools
 import random
 import re
