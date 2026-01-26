@@ -47,11 +47,12 @@ nan_handling_method: masked
 optimizer: Adam
 loss: MSE
 learning_rate:
-  0: 1e-3
-  10: 1e-4
-  20: 1e-4
+  0: 7e-3
+  10: 5e-4
+  25: 3e-4
+  30: 1e-4
 
-batch_size: 64
+batch_size: 32
 epochs: 60
 clip_gradient_norm: 1
 
