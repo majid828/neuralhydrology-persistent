@@ -307,6 +307,33 @@ class Config(object):
     def warmup_period(self) -> int:
         return self._cfg.get("warmup_period", 0)
 
+    # ==================================================================
+    # CHANGE (NEW): Allow evaluation warm-up keys in YAML
+    # This fixes: ValueError: ['eval_warmup_steps'] are not recognized config keys.
+    # ==================================================================
+    @property
+    def eval_warmup_steps(self) -> int:
+        """Evaluation warm-up length in timesteps (per basin).
+
+        YAML keys supported:
+          - eval_warmup_steps: preferred
+          - eval_warmup: alias
+        """
+        w = self._cfg.get("eval_warmup_steps", None)
+        if w is None:
+            w = self._cfg.get("eval_warmup", 0)
+        try:
+            w = int(w)
+        except Exception:
+            w = 0
+        return max(0, w)
+
+    @property
+    def eval_warmup(self) -> int:
+        """Alias for eval_warmup_steps (kept for convenience)."""
+        return self.eval_warmup_steps
+    # ==================================================================
+
     @property
     def dynamic_inputs(self) -> Union[list[str], list[list[str]], dict[str, list[str]]]:
         return self._get_value_verbose("dynamic_inputs")
