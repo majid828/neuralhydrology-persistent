@@ -72,6 +72,10 @@ class BaseTester(object):
         # persistent hidden for evaluation (reset per basin)
         self._persistent_hidden_eval: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
+        # NEW: evaluation drop_last switch (default: False for unbiased metrics)
+        # If you want to exactly mirror training behavior, set eval_drop_last: True in YAML.
+        self._eval_drop_last: bool = bool(getattr(self.cfg, "eval_drop_last", False))
+
         self._load_run_data()
 
     def _set_device(self):
@@ -140,7 +144,7 @@ class BaseTester(object):
 
     # ------------------------------------------------------------------
     # Chronological loader inside a basin (for persistent eval)
-    # IMPORTANT: drop_last=True to match your basetrainer sampler.
+    # NEW: default drop_last=False for evaluation to avoid biased metrics.
     # ------------------------------------------------------------------
     @staticmethod
     def _safe_to_numpy(x: Any) -> np.ndarray:
@@ -179,8 +183,10 @@ class BaseTester(object):
 
         batch_size = int(self.cfg.batch_size)
         batches = [sorted_indices[i: i + batch_size] for i in range(0, len(sorted_indices), batch_size)]
-        # MATCH TRAINING: drop_last=True
-        batches = [b for b in batches if len(b) == batch_size]
+
+        # NEW: evaluation drop_last behavior is configurable (default False)
+        if self._eval_drop_last:
+            batches = [b for b in batches if len(b) == batch_size]
 
         class _ListBatchSampler(torch.utils.data.Sampler):
             def __init__(self, batches_):
@@ -221,7 +227,8 @@ class BaseTester(object):
         else:
             seq_length = int(seq_length)
 
-        # your code allowed both (1, seq_length); keep as-is.
+        # Recommended for strict persistence is seq_stride == seq_length,
+        # but we keep your permissive option to avoid breaking configs.
         return seq_stride in (1, seq_length)
 
     # ------------------------------------------------------------------
@@ -234,10 +241,6 @@ class BaseTester(object):
         Supported config keys (put in YAML):
           - eval_warmup_steps: integer timesteps (recommended)
           - eval_warmup: alias for eval_warmup_steps
-
-        Examples:
-          daily:  eval_warmup_steps: 365
-          hourly: eval_warmup_steps: 720  # 30 days * 24
         """
         w = getattr(self.cfg, "eval_warmup_steps", None)
         if w is None:
@@ -599,21 +602,20 @@ class BaseTester(object):
 
     # ------------------------------------------------------------------
     # Persistent eval that MATCHES your BaseTrainer flatten logic
-    # + 100% CAUSAL WARM-UP PER BASIN (spin-up)
+    # + CORRECT per-basin safety checks
+    # + CAUSAL warm-up in timesteps (with sequence-aligned saving)
     # ------------------------------------------------------------------
     def _evaluate_persistent_match_training_with_flatten(
         self, model: BaseModel, loader: DataLoader, frequencies: List[str], save_all_output: bool = False
     ):
         """
-        100% causal warm-up logic (per basin):
-
-        If warm-up ends inside a loader batch:
-          1) run forward on warm-up portion first (update hidden, do not store)
-          2) then run forward on remaining portion (store outputs)
-
-        IMPORTANT: because your training flatten order treats each "row" (sequence) as the next time block
-        (seq1 then seq2 then ...), we implement warm-up on whole-sequence boundaries to keep the NH metrics
-        pipeline consistent (still [B,L] blocks).
+        Key corrections:
+          1) Safety check: ensure batch contains ONE basin (no leakage).
+          2) Warm-up is tracked in *timesteps* across the flattened stream.
+             - We run warmup steps causally, updating hidden but not saving outputs.
+             - To keep NH metrics pipeline consistent, we only *save* outputs aligned to full sequences.
+               If warm-up ends mid-sequence, we still warm-up exactly, but we drop the remaining partial
+               sequence tail until the next full-sequence boundary.
         """
         freq = frequencies[0]
         predict_last_n = self.cfg.predict_last_n
@@ -623,11 +625,10 @@ class BaseTester(object):
         preds, obs, dates, all_output = {}, {}, {}, {}
         losses = []
 
-        hidden = self._persistent_hidden_eval  # starts None per basin (set/reset in evaluate())
+        hidden = self._persistent_hidden_eval  # starts None per basin
 
-        # warm-up in timesteps -> convert to warm-up sequences (each sequence contributes L timesteps in flatten stream)
         eval_warmup_steps = self._get_eval_warmup_steps()
-        warmed_sequences = 0  # number of full sequences already used for warm-up in this basin
+        warmup_done_steps = 0  # timesteps consumed for warm-up (in flattened time)
 
         with torch.no_grad():
             for data in loader:
@@ -640,12 +641,20 @@ class BaseTester(object):
 
                 data = model.pre_model_hook(data, is_train=False)
 
+                # SAFETY: ensure one basin per batch (mirrors your BaseTrainer)
+                if "basin_idx" not in data or (not torch.is_tensor(data["basin_idx"])):
+                    raise RuntimeError("Persistent eval requires basin_idx in batch.")
+                flat_b = data["basin_idx"].view(-1)
+                if not torch.all(flat_b == flat_b[0]):
+                    raise RuntimeError("Eval batch contains multiple basins -> hidden-state leakage risk. Fix dataset/loader.")
+
                 # infer B,L from x_d
                 if "x_d" not in data or not isinstance(data["x_d"], dict) or len(data["x_d"]) == 0:
                     raise RuntimeError("Persistent eval: expected data['x_d'] dict with dynamic inputs.")
                 any_xd = next(iter(data["x_d"].values()))
                 if any_xd.dim() < 2:
                     raise RuntimeError("Persistent eval: expected x_d tensors with shape [B, L, ...].")
+
                 B_inferred, L_inferred = int(any_xd.shape[0]), int(any_xd.shape[1])
 
                 # build flattened view (exactly like trainer)
@@ -671,7 +680,7 @@ class BaseTester(object):
 
                 seg_len = B_inferred * L_inferred
 
-                # force x_s to batch=1 (same as trainer) -- applies to both warm & eval slices
+                # force x_s to batch=1 (same as trainer)
                 def _fix_xs(seg_dict: Dict[str, object]) -> None:
                     if "x_s" in data:
                         if isinstance(data["x_s"], dict):
@@ -679,25 +688,18 @@ class BaseTester(object):
                         else:
                             seg_dict["x_s"] = data["x_s"][0:1, ...]
 
-                # how many sequences total should be used for warm-up?
-                warmup_total_sequences = 0
-                if eval_warmup_steps > 0:
-                    warmup_total_sequences = int(np.ceil(eval_warmup_steps / max(1, L_inferred)))
+                # ---- warm-up handling (in timesteps across flattened stream) ----
+                warmup_remaining = max(0, eval_warmup_steps - warmup_done_steps)
 
-                # how many sequences in THIS batch still belong to warm-up?
-                warmup_sequences_remaining = max(0, warmup_total_sequences - warmed_sequences)
-                warm_seqs_in_batch = min(B_inferred, warmup_sequences_remaining)
+                # We may need to warm-up some/all of this batch
+                warm_T = min(seg_len, warmup_remaining)
 
-                # ----------------------------------------------------------
-                # (1) Warm-up forward on first warm_seqs_in_batch sequences
-                # ----------------------------------------------------------
-                if warm_seqs_in_batch > 0:
-                    warm_T = warm_seqs_in_batch * L_inferred
+                # (1) warm-up slice (update hidden, do not save)
+                if warm_T > 0:
                     warm_seg = self._slice_time_segment(reshaped, slice(0, warm_T))
                     _fix_xs(warm_seg)
 
                     warm_pred = model(warm_seg, hidden_state=hidden)
-
                     new_hidden = warm_pred.get("hidden_state", None)
                     if new_hidden is not None:
                         h, c = new_hidden
@@ -705,26 +707,43 @@ class BaseTester(object):
                     else:
                         hidden = None
 
-                    warmed_sequences += warm_seqs_in_batch
+                    warmup_done_steps += warm_T
 
-                    # if whole batch is warm-up, continue to next batch (do not store anything)
-                    if warm_seqs_in_batch >= B_inferred:
+                    # If the whole batch was warm-up, continue
+                    if warm_T >= seg_len:
                         continue
 
-                # ----------------------------------------------------------
-                # (2) Evaluation forward on remaining sequences (causal)
-                # ----------------------------------------------------------
-                eval_seqs = B_inferred - warm_seqs_in_batch
-                eval_T = eval_seqs * L_inferred
-                eval_start = warm_seqs_in_batch * L_inferred
+                # (2) evaluation slice (remaining timesteps)
+                eval_start = warm_T
+                eval_T = seg_len - warm_T
                 eval_end = eval_start + eval_T
+
+                # IMPORTANT: To keep NH metrics pipeline consistent, we only save on full-sequence boundaries.
+                # If eval_start is not aligned to L, drop the initial partial (we already warmed it causally).
+                misalign = eval_start % L_inferred
+                if misalign != 0:
+                    drop = L_inferred - misalign
+                    # run forward on the dropped part to keep hidden correct (already causal)
+                    drop_seg = self._slice_time_segment(reshaped, slice(eval_start, min(eval_end, eval_start + drop)))
+                    _fix_xs(drop_seg)
+                    drop_pred = model(drop_seg, hidden_state=hidden)
+                    new_hidden = drop_pred.get("hidden_state", None)
+                    if new_hidden is not None:
+                        h, c = new_hidden
+                        hidden = (h.detach(), c.detach())
+                    else:
+                        hidden = None
+                    eval_start = min(eval_end, eval_start + drop)
+                    eval_T = eval_end - eval_start
+                    if eval_T <= 0:
+                        continue
 
                 eval_seg = self._slice_time_segment(reshaped, slice(eval_start, eval_end))
                 _fix_xs(eval_seg)
 
                 pred = model(eval_seg, hidden_state=hidden)
 
-                # update hidden after eval part (carry to next batch)
+                # update hidden after eval part
                 new_hidden = pred.get("hidden_state", None)
                 if new_hidden is not None:
                     h, c = new_hidden
@@ -732,11 +751,14 @@ class BaseTester(object):
                 else:
                     hidden = None
 
-                # compute losses on eval part only (clean + causal)
+                # compute losses on eval part only
                 _, all_losses = self.loss_obj(pred, eval_seg)
                 losses.append({k: float(v.detach().cpu().item()) for k, v in all_losses.items()})
 
-                # rebuild predictions to [eval_seqs, L, ...] so metrics code stays unchanged
+                # Rebuild predictions to [Nseq, L, ...]
+                # eval_T is aligned to L now
+                eval_seqs = eval_T // L_inferred
+
                 full_predictions: Dict[str, torch.Tensor] = {}
                 for k, v in pred.items():
                     if v is None or isinstance(v, dict) or k == "hidden_state":
@@ -746,25 +768,28 @@ class BaseTester(object):
                     if v.dim() >= 2 and v.shape[0] == 1 and v.shape[1] == eval_T:
                         full_predictions[k] = v.reshape(eval_seqs, L_inferred, *v.shape[2:])
 
-                # slice original data to match the eval portion (drop warm sequences along dim0)
-                if warm_seqs_in_batch > 0:
+                # Now we must slice original (unflattened) data to match what we saved.
+                # Saved sequences correspond to the LAST `eval_seqs` sequences in this batch after dropping warm+misalign.
+                # Convert eval_start (in timesteps) into how many full sequences were dropped from the front.
+                dropped_full_seqs = eval_start // L_inferred
+                if dropped_full_seqs > 0:
                     data_kept: Dict[str, object] = {}
                     for k, v in data.items():
                         if k.startswith("x_d") and isinstance(v, dict):
-                            data_kept[k] = {feat: vv[warm_seqs_in_batch:, ...] for feat, vv in v.items()}
+                            data_kept[k] = {feat: vv[dropped_full_seqs:, ...] for feat, vv in v.items()}
                         elif k.startswith("date"):
                             try:
-                                data_kept[k] = v[warm_seqs_in_batch:, ...]
+                                data_kept[k] = v[dropped_full_seqs:, ...]
                             except Exception:
                                 data_kept[k] = v
                         elif torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == B_inferred:
-                            data_kept[k] = v[warm_seqs_in_batch:, ...]
+                            data_kept[k] = v[dropped_full_seqs:, ...]
                         else:
                             data_kept[k] = v
                 else:
                     data_kept = data
 
-                # optional save_all_output (only eval part)
+                # Optional save_all_output (only eval part)
                 if save_all_output:
                     if all_output:
                         for k, v in full_predictions.items():
@@ -772,7 +797,7 @@ class BaseTester(object):
                     else:
                         all_output = {k: [v.detach().cpu().numpy()] for k, v in full_predictions.items()}
 
-                # store preds/obs/dates for metrics (eval part only)
+                # Store preds/obs/dates for metrics (eval part only)
                 if predict_last_n[freq] != 0:
                     freq_key = ""  # single-frequency path
                     y_hat_sub, y_sub = self._subset_targets(model, data_kept, full_predictions, predict_last_n[freq], freq_key)
