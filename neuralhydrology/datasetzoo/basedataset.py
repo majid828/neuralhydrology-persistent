@@ -4,7 +4,7 @@ import re
 import sys
 import warnings
 from collections import defaultdict
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -26,36 +26,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class BaseDataset(Dataset):
-    """Base data set class to load and preprocess data.
-    
-    Use subclasses of this class for training/evaluating a model on a specific data set. E.g. use `CamelsUS` for the US
-    CAMELS data set and `CamelsGB` for the CAMELS GB data set.
-
-    Parameters
-    ----------
-    cfg : Config
-        The run configuration.
-    is_train : bool 
-        Defines if the dataset is used for training or evaluating. If True (training), means/stds for each feature
-        are computed and stored to the run directory. If one-hot encoding is used, the mapping for the one-hot encoding 
-        is created and also stored to disk. If False, a `scaler` input is expected and similarly the `id_to_int` input
-        if one-hot encoding is used. 
-    period : {'train', 'validation', 'test'}
-        Defines the period for which the data will be loaded
-    basin : str, optional
-        If passed, the data for only this basin will be loaded. Otherwise, the basin(s) is(are) read from the
-        appropriate basin file, corresponding to the `period`.
-    additional_features : List[Dict[str, pd.DataFrame]], optional
-        List of dictionaries, mapping from a basin id to a pandas DataFrame. This DataFrame will be added to the data
-        loaded from the dataset and all columns are available as 'dynamic_inputs', 'evolving_attributes' and
-        'target_variables'
-    id_to_int : Dict[str, int], optional
-        If the config argument 'use_basin_id_encoding' is True in the config and period is either 'validation' or 
-        'test', this input is required. It is a dictionary, mapping from basin id to an integer (the one-hot encoding).
-    scaler : Dict[str, Union[pd.Series, xarray.DataArray]], optional
-        If period is either 'validation' or 'test', this input is required. It contains the centering and scaling
-        for each feature and is stored to the run directory during training (train_data/train_data_scaler.yml).
-    """
+    """Base data set class to load and preprocess data."""
 
     def __init__(self,
                  cfg: Config,
@@ -86,23 +57,29 @@ class BaseDataset(Dataset):
                 raise ValueError('Timestep counter only works for forecast data.')
             if cfg.forecast_overlap:
                 overlap_zeros = torch.zeros((cfg.forecast_overlap, 1))
-                forecast_counter = torch.Tensor(range(1, cfg.forecast_seq_length - cfg.forecast_overlap + 1)).unsqueeze(-1)
+                forecast_counter = torch.Tensor(
+                    range(1, cfg.forecast_seq_length - cfg.forecast_overlap + 1)
+                ).unsqueeze(-1)
                 self.forecast_counter = torch.concatenate([overlap_zeros, forecast_counter], dim=0)
-                self.hindcast_counter = torch.zeros((cfg.seq_length - cfg.forecast_seq_length + cfg.forecast_overlap, 1))
+                self.hindcast_counter = torch.zeros(
+                    (cfg.seq_length - cfg.forecast_seq_length + cfg.forecast_overlap, 1)
+                )
             else:
                 self.forecast_counter = torch.Tensor(range(1, cfg.forecast_seq_length + 1)).unsqueeze(-1)
                 self.hindcast_counter = torch.zeros((cfg.seq_length - cfg.forecast_seq_length, 1))
-            
+
         if basin is None:
             self.basins = utils.load_basin_file(getattr(cfg, f"{period}_basin_file"))
         else:
             self.basins = [basin]
+
         # Map basin id -> integer index (used for persistent LSTM state resets)
         self._basin_to_idx = {b: i for i, b in enumerate(self.basins)}
 
         self.additional_features = additional_features
         self.id_to_int = id_to_int
         self.scaler = scaler
+
         # don't compute scale when finetuning
         if is_train and not scaler:
             self._compute_scaler = True
@@ -114,6 +91,7 @@ class BaseDataset(Dataset):
         self.seq_len = None
         self._predict_last_n = None
         self._initialize_frequency_configuration()
+
         # ------------------------------------------------------------------
         # Persistent / subsampling options (e.g. for persistent LSTM)
         # Defaults keep the original behavior: use every valid sample (stride=1)
@@ -123,6 +101,12 @@ class BaseDataset(Dataset):
 
         # during training we log data processing with progress bars, but not during validation/testing
         self._disable_pbar = cfg.verbose == 0 or not self.is_train
+
+        # NEW: desired run frequency (single-frequency mode)
+        self.run_frequency: Optional[str] = getattr(cfg, "run_frequency", None)  # e.g., "1H" or "15min"
+        # NEW: variables that must be treated as accumulated (sum-type) when resampling.
+        # Example: precipitation totals, discharge depth-per-step totals, etc.
+        self.sum_variables: Set[str] = set(getattr(cfg, "sum_variables", []) or [])
 
         # initialize class attributes that are filled in the data loading functions
         self._x_d = {}
@@ -144,7 +128,6 @@ class BaseDataset(Dataset):
 
         if cfg.use_basin_id_encoding:
             if self.is_train:
-                # creates lookup table for the number of basins in the training set
                 self._create_id_to_int()
 
         # load and preprocess data
@@ -166,9 +149,9 @@ class BaseDataset(Dataset):
         for freq, seq_len, idx in zip(self.frequencies, self.seq_len, indices):
             # if there's just one frequency, don't use suffixes.
             freq_suffix = '' if len(self.frequencies) == 1 else f'_{freq}'
-            # slice until idx + 1 because slice-end is excluding
             hindcast_start_idx = idx + 1 - seq_len
             global_end_idx = idx + 1
+
             if self.cfg.forecast_seq_length:
                 hindcast_end_idx = idx + 1 - self.cfg.forecast_seq_length
                 forecast_start_idx = idx + 1 - self.cfg.forecast_seq_length
@@ -177,10 +160,12 @@ class BaseDataset(Dataset):
             else:
                 hindcast_end_idx = None
                 forecast_start_idx = None
+
             x_d_key = f'x_d{freq_suffix}'
             sample[x_d_key] = {}
             sample[f'{x_d_key}_hindcast'] = {}
             sample[f'{x_d_key}_forecast'] = {}
+
             for k, v in self._x_d[basin][freq].items():
                 if k in self.cfg.hindcast_inputs_flattened:
                     sample[f'{x_d_key}_hindcast'][k] = v[hindcast_start_idx:hindcast_end_idx]
@@ -191,13 +176,15 @@ class BaseDataset(Dataset):
 
             if self.is_train and (self.cfg.nan_step_probability or self.cfg.nan_sequence_probability):
                 if self.cfg.hindcast_inputs_flattened:
-                    sample[f'{x_d_key}_hindcast'] = self._add_nan_streaks(sample[f'{x_d_key}_hindcast'],
-                                                                          groups=self.cfg.hindcast_inputs)
-                    sample[f'{x_d_key}_forecast'] = self._add_nan_streaks(sample[f'{x_d_key}_forecast'],
-                                                                          groups=self.cfg.forecast_inputs)
+                    sample[f'{x_d_key}_hindcast'] = self._add_nan_streaks(
+                        sample[f'{x_d_key}_hindcast'], groups=self.cfg.hindcast_inputs
+                    )
+                    sample[f'{x_d_key}_forecast'] = self._add_nan_streaks(
+                        sample[f'{x_d_key}_forecast'], groups=self.cfg.forecast_inputs
+                    )
                 else:
-                    sample[x_d_key] = self._add_nan_streaks(sample[x_d_key],
-                                                            groups=self.cfg.dynamic_inputs)
+                    sample[x_d_key] = self._add_nan_streaks(sample[x_d_key], groups=self.cfg.dynamic_inputs)
+
             sample[f'y{freq_suffix}'] = self._y[basin][freq][hindcast_start_idx:global_end_idx]
             sample[f'date{freq_suffix}'] = self._dates[basin][freq][hindcast_start_idx:global_end_idx]
 
@@ -217,8 +204,9 @@ class BaseDataset(Dataset):
         if self._per_basin_target_stds:
             sample['per_basin_target_stds'] = self._per_basin_target_stds[basin]
         if self.id_to_int:
-            sample['x_one_hot'] = torch.nn.functional.one_hot(torch.tensor(self.id_to_int[basin]),
-                                                              num_classes=len(self.id_to_int)).to(torch.float32)
+            sample['x_one_hot'] = torch.nn.functional.one_hot(
+                torch.tensor(self.id_to_int[basin]), num_classes=len(self.id_to_int)
+            ).to(torch.float32)
 
         return sample
 
@@ -228,16 +216,19 @@ class BaseDataset(Dataset):
             raise ValueError('For dropout streaks, dynamic_inputs must be a list of lists.')
         seq_length = x_d[groups[0][0]].shape[0]
         drop_masks = np.zeros((len(groups), seq_length, 1), dtype=bool)
-        drop_sequences = np.random.choice([True, False], p=[self.cfg.nan_sequence_probability,
-                                                            1-self.cfg.nan_sequence_probability],
-                                          size=len(groups))
+        drop_sequences = np.random.choice(
+            [True, False],
+            p=[self.cfg.nan_sequence_probability, 1 - self.cfg.nan_sequence_probability],
+            size=len(groups)
+        )
         if drop_sequences.all():
-            # Don't allow all sequences to be dropped out.
             drop_sequences[np.random.choice(len(groups))] = False
         for i in range(len(groups)):
-            drop_steps = np.random.choice([True, False], p=[self.cfg.nan_step_probability,
-                                                            1-self.cfg.nan_step_probability],
-                                          size=(seq_length, 1))
+            drop_steps = np.random.choice(
+                [True, False],
+                p=[self.cfg.nan_step_probability, 1 - self.cfg.nan_step_probability],
+                size=(seq_length, 1)
+            )
             drop_masks[i] = drop_sequences[i] | drop_steps
         drop_masks = torch.from_numpy(drop_masks)
         for i, group in enumerate(groups):
@@ -253,10 +244,91 @@ class BaseDataset(Dataset):
         """This function has to return the attributes in a basin-indexed DataFrame."""
         raise NotImplementedError
 
+    # ---------------------------------------------------------------------
+    # NEW: Robust resampling helper (hourly <-> 15min) controlled by YAML
+    # This is the FIX for your error: factor=0 when converting 1H -> 15min.
+    # ---------------------------------------------------------------------
+    def _infer_native_frequency_safe(self, index: pd.DatetimeIndex) -> str:
+        try:
+            freq = utils.infer_frequency(index)
+        except Exception:
+            freq = None
+        if not freq:
+            freq = pd.infer_freq(index)
+        if not freq:
+            raise ValueError("Could not infer native frequency from basin time index.")
+        return str(freq)
+
+    def _ensure_complete_time_index(self, df: pd.DataFrame, freq: str) -> pd.DataFrame:
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep="first")]
+        full = pd.date_range(start=df.index[0], end=df.index[-1], freq=freq)
+        return df.reindex(pd.DatetimeIndex(full, name=df.index.name))
+
+    def _resample_basin_df_to_run_frequency(self, df: pd.DataFrame, run_freq: Optional[str]) -> pd.DataFrame:
+        """Convert basin dataframe df to run_freq ("1H" or "15min", etc.).
+
+        Rules:
+        - sum_variables: treated as accumulated amounts over the time step:
+            * upsample (e.g., 1H -> 15min): forward-fill then divide by factor
+            * downsample (e.g., 15min -> 1H): sum
+        - all other variables: treated as mean/state:
+            * upsample: forward-fill
+            * downsample: mean
+        """
+        if run_freq is None or str(run_freq).lower() in ["none", "null", ""]:
+            return df
+        if df.empty:
+            return df
+
+        native_freq = self._infer_native_frequency_safe(df.index)
+
+        # already same resolution
+        try:
+            if to_offset(native_freq) == to_offset(run_freq):
+                return df
+        except Exception:
+            pass
+
+        # regularize native grid (avoids weird resample artifacts)
+        df = self._ensure_complete_time_index(df, native_freq)
+
+        native_dt = to_offset(native_freq).delta
+        run_dt = to_offset(run_freq).delta
+        if native_dt is None or run_dt is None:
+            raise ValueError(f"Unsupported frequency conversion: {native_freq} -> {run_freq}")
+
+        # ratio = native step / run step
+        ratio = native_dt / run_dt
+        if ratio <= 0:
+            raise ValueError(f"Invalid frequency ratio from {native_freq} to {run_freq}: {ratio}")
+
+        sum_cols = [c for c in df.columns if c in self.sum_variables]
+
+        # Upsample (e.g., 1H -> 15min): ratio = 4
+        if ratio > 1:
+            k = int(round(float(ratio)))
+            if abs(float(ratio) - k) > 1e-6:
+                raise ValueError(f"Non-integer upsample ratio {native_freq} -> {run_freq}: {ratio}")
+
+            df_up = df.resample(run_freq).ffill()
+            if sum_cols:
+                df_up[sum_cols] = df_up[sum_cols] / k
+            return df_up
+
+        # Downsample (e.g., 15min -> 1H): ratio = 0.25 => inv = 4
+        inv = 1.0 / float(ratio)
+        k = int(round(inv))
+        if abs(inv - k) > 1e-6:
+            raise ValueError(f"Non-integer downsample ratio {native_freq} -> {run_freq}: {inv}")
+
+        agg = {c: ("sum" if c in self.sum_variables else "mean") for c in df.columns}
+        df_dn = df.resample(run_freq).agg(agg)
+        return df_dn
+
     def _create_id_to_int(self):
         self.id_to_int = {str(b): i for i, b in enumerate(np.random.permutation(self.basins))}
 
-        # dump id_to_int dictionary into run directory for validation
         file_path = self.cfg.train_dir / "id_to_int.yml"
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with file_path.open("w") as fp:
@@ -264,7 +336,6 @@ class BaseDataset(Dataset):
             yaml.dump(self.id_to_int, fp)
 
     def _dump_scaler(self):
-        # dump scaler dictionary into run directory for inference
         scaler = defaultdict(dict)
         for key, value in self.scaler.items():
             if isinstance(value, pd.Series) or isinstance(value, xarray.Dataset):
@@ -278,25 +349,20 @@ class BaseDataset(Dataset):
             yaml.dump(dict(scaler), fp)
 
     def _get_start_and_end_dates(self):
-
-        # if no per-basin periods file exist, same periods are taken for all basins from the config
         if getattr(self.cfg, f"per_basin_{self.period}_periods_file") is None:
-
-            # even if single dates, everything is mapped to lists, so we can iterate over them
             if isinstance(getattr(self.cfg, f'{self.period}_start_date'), list):
                 if self.period != "train":
                     raise ValueError("Evaluation on split periods currently not supported")
                 start_dates = getattr(self.cfg, f'{self.period}_start_date')
             else:
                 start_dates = [getattr(self.cfg, f'{self.period}_start_date')]
+
             if isinstance(getattr(self.cfg, f'{self.period}_end_date'), list):
                 end_dates = getattr(self.cfg, f'{self.period}_end_date')
             else:
                 end_dates = [getattr(self.cfg, f'{self.period}_end_date')]
 
             self.start_and_end_dates = {b: {'start_dates': start_dates, 'end_dates': end_dates} for b in self.basins}
-
-        # read periods from file
         else:
             with open(getattr(self.cfg, f"per_basin_{self.period}_periods_file"), 'rb') as fp:
                 self.start_and_end_dates = pickle.load(fp)
@@ -310,67 +376,49 @@ class BaseDataset(Dataset):
         for feature, n_duplicates in self.cfg.duplicate_features.items():
             for n in range(1, n_duplicates + 1):
                 df[f"{feature}_copy{n}"] = df[feature]
-
         return df
-    
+
     def _add_missing_targets(self, df: pd.DataFrame) -> pd.DataFrame:
         for var in self.cfg.target_variables:
             if var not in df.columns:
                 df[var] = np.nan
-
         return df
 
     def _add_lagged_features(self, df: pd.DataFrame) -> pd.DataFrame:
-
-        # check that all autoregressive inputs are contained in the list of shifted variables
         self._check_autoregressive_inputs()
 
-        # create the shifted varaibles, as requested
         for feature, shift in self.cfg.lagged_features.items():
             if isinstance(shift, list):
-                # only consider unique shift values, otherwise we have columns with identical names
                 for s in set(shift):
                     df[f"{feature}_shift{s}"] = df[feature].shift(periods=s, freq="infer")
             elif isinstance(shift, int):
                 df[f"{feature}_shift{shift}"] = df[feature].shift(periods=shift, freq="infer")
             else:
                 raise ValueError("The value of the 'lagged_features' arg must be either an int or a list of ints")
-
         return df
 
     def _check_autoregressive_inputs(self):
-        # The dataset requires that AR inputs be lagged features, however in general when constructing the dataset
-        # we do not care whether these are lagged targets, specifically. The requirement that AR inputs be lagged
-        # targets, although typical for AR models, is not strictly required and depends on how these features are
-        # used in any particular model.
         for input in self.cfg.autoregressive_inputs:
             capture = re.compile(r'^(.*)_shift(\d+)$').search(input)
             if not capture:
-                raise ValueError('Autoregressive inputs must be a shifted variable with form <variable>_shift<lag> ',
+                raise ValueError('Autoregressive inputs must be a shifted variable with form <variable>_shift<lag> '
                                  f'where <lag> is an integer. Instead got: {input}.')
-            if capture[1] not in self.cfg.lagged_features or int(
-                    capture[2]) not in self.cfg.lagged_features[capture[1]]:
+            if capture[1] not in self.cfg.lagged_features or int(capture[2]) not in self.cfg.lagged_features[capture[1]]:
                 raise ValueError('Autoregressive inputs must be in the list of "lagged_inputs".')
         return
 
     def _load_or_create_xarray_dataset(self) -> xarray.Dataset:
-        # if no netCDF file is passed, data set is created from raw basin files
         if (self.cfg.train_data_file is None) or (not self.is_train):
             data_list = []
 
-            # list of columns to keep, everything else will be removed to reduce memory footprint
             keep_cols = self.cfg.target_variables + self.cfg.evolving_attributes + self.cfg.mass_inputs + self.cfg.autoregressive_inputs
 
             if isinstance(self.cfg.dynamic_inputs, list):
                 keep_cols += self.cfg.dynamic_inputs_flattened
             else:
-                # keep all frequencies' dynamic inputs
                 keep_cols += [i for inputs in self.cfg.dynamic_inputs.values() for i in inputs]
 
-            # Keep the dynamic_conceptual_inputs
             keep_cols += self.cfg.dynamic_conceptual_inputs
-
-            # make sure that even inputs that are used in multiple frequencies occur only once in the df
             keep_cols = list(sorted(set(keep_cols)))
 
             if not self._disable_pbar:
@@ -378,20 +426,14 @@ class BaseDataset(Dataset):
             for basin in tqdm(self.basins, disable=self._disable_pbar, file=sys.stdout):
                 df = self._load_basin_data(basin)
 
-                # add columns from dataframes passed as additional data files
                 df = pd.concat([df, *[d[basin] for d in self.additional_features]], axis=1)
 
-                # if target variables are missing for basin, add empty column to still allow predictions to be made
                 if not self.is_train:
                     df = self._add_missing_targets(df)
 
-                # check if any feature should be duplicated
                 df = self._duplicate_features(df)
-
-                # check if a shifted copy of a feature should be added
                 df = self._add_lagged_features(df)
 
-                # remove unnecessary columns
                 try:
                     df = df[keep_cols]
                 except KeyError:
@@ -402,7 +444,6 @@ class BaseDataset(Dataset):
                     ]
                     raise KeyError("".join(msg))
 
-                # remove random portions of the timeseries of dynamic features
                 for holdout_variable, holdout_dict in self.cfg.random_holdout_from_dynamic_features.items():
                     df[holdout_variable] = samplingutils.bernoulli_subseries_sampler(
                         data=df[holdout_variable].values,
@@ -410,8 +451,11 @@ class BaseDataset(Dataset):
                         mean_missing_length=holdout_dict['mean_missing_length'],
                     )
 
-                # Make end_date the last second of the specified day, such that the
-                # dataset will include all hours of the last day, not just 00:00.
+                # NEW: enforce requested run frequency (hourly or 15min)
+                if self.run_frequency is not None:
+                    df = self._resample_basin_df_to_run_frequency(df, self.run_frequency)
+
+                # Make end_date the last second of the specified day
                 start_dates = self.start_and_end_dates[basin]["start_dates"]
                 end_dates = [
                     date + pd.Timedelta(days=1, seconds=-1) for date in self.start_and_end_dates[basin]["end_dates"]
@@ -419,11 +463,8 @@ class BaseDataset(Dataset):
 
                 native_frequency = utils.infer_frequency(df.index)
                 if not self.frequencies:
-                    self.frequencies = [native_frequency]  # use df's native resolution by default
+                    self.frequencies = [native_frequency]
 
-                # Assert that the used frequencies are lower or equal than the native frequency. There may be cases
-                # where our logic cannot determine whether this is the case, because pandas might return an exotic
-                # native frequency. In this case, all we can do is print a warning and let the user check themselves.
                 try:
                     freq_vs_native = [utils.compare_frequencies(freq, native_frequency) for freq in self.frequencies]
                 except ValueError:
@@ -433,48 +474,29 @@ class BaseDataset(Dataset):
                 if any(comparison > 1 for comparison in freq_vs_native):
                     raise ValueError(f'Frequency is higher than native data frequency {native_frequency}.')
 
-                # used to get the maximum warmup-offset across all frequencies. We don't use to_timedelta because it
-                # does not support all frequency strings. We can't calculate the maximum offset here, because to
-                # compare offsets, they need to be anchored to a specific date (here, the start date).
                 offsets = [(self.seq_len[i] - self._predict_last_n[i]) * to_offset(freq)
                            for i, freq in enumerate(self.frequencies)]
 
                 basin_data_list = []
-                # create xarray data set for each period slice of the specific basin
                 for i, (start_date, end_date) in enumerate(zip(start_dates, end_dates)):
-                    # if the start date is not aligned with the frequency, the resulting datetime indices will be off
                     if not all(to_offset(freq).is_on_offset(start_date) for freq in self.frequencies):
                         misaligned = [freq for freq in self.frequencies if not to_offset(freq).is_on_offset(start_date)]
                         raise ValueError(f'start date {start_date} is not aligned with frequencies {misaligned}.')
-                    # add warmup period, so that we can make prediction at the first time step specified by period.
-                    # offsets has the warmup offset needed for each frequency; the overall warmup starts with the
-                    # earliest date, i.e., the largest offset across all frequencies.
+
                     warmup_start_date = min(start_date - offset for offset in offsets)
                     df_sub = df[warmup_start_date:end_date]
 
-                    # make sure the df covers the full date range from warmup_start_date to end_date, filling any gaps
-                    # with NaNs. This may increase runtime, but is a very robust way to make sure dates and predictions
-                    # keep in sync. In training, the introduced NaNs will be discarded, so this only affects evaluation.
                     full_range = pd.date_range(start=warmup_start_date, end=end_date, freq=native_frequency)
                     df_sub = df_sub.reindex(pd.DatetimeIndex(full_range, name=df_sub.index.name))
 
-                    # as double check, set all targets before period start to NaN
                     df_sub.loc[df_sub.index < start_date, self.cfg.target_variables] = np.nan
-
                     basin_data_list.append(df_sub)
 
                 if not basin_data_list:
-                    # Skip basin in case no start and end dates where defined.
                     continue
 
-                # In case of multiple time slices per basin, stack the time slices in the time dimension.
                 df = pd.concat(basin_data_list, axis=0)
 
-                # Because of overlaps between warmup period of one slice and training period of another slice, there can
-                # be duplicated indices. The next block of code creates two subset dataframes. First, a subset with all
-                # non-duplicated indices. Second, a subset with duplicated indices, of which we keep the rows, where the
-                # target value is not NaN (because we remove the target variable during warmup periods but want to keep
-                # them if they are target in another temporal slice).
                 df_non_duplicated = df[~df.index.duplicated(keep=False)]
                 df_duplicated = df[df.index.duplicated(keep=False)]
 
@@ -482,40 +504,34 @@ class BaseDataset(Dataset):
                 for _, grp in df_duplicated.groupby('date'):
                     mask = ~grp[self.cfg.target_variables].isna().any(axis=1)
                     if not mask.any():
-                        # In case all duplicates have a NaN value for the targets, pick the first. This can happen, if
-                        # the day itself has a missing observation.
                         filtered_duplicates.append(grp.head(1))
                     else:
-                        # If at least one duplicate has values in the target columns, take the first of these rows.
                         filtered_duplicates.append(grp[mask].head(1))
 
                 if filtered_duplicates:
-                    # Combine the filtered duplicates with the non-duplicates.
                     df_filtered_duplicates = pd.concat(filtered_duplicates, axis=0)
                     df = pd.concat([df_non_duplicated, df_filtered_duplicates], axis=0)
                 else:
-                    # Else, if no duplicates existed, continue with only the non-duplicate df.
                     df = df_non_duplicated
 
-                # Sort by DatetimeIndex and reindex to fill gaps with NaNs.
                 df = df.sort_index(axis=0, ascending=True)
                 df = df.reindex(
-                    pd.DatetimeIndex(data=pd.date_range(df.index[0], df.index[-1], freq=native_frequency),
-                                     name=df.index.name))
+                    pd.DatetimeIndex(
+                        data=pd.date_range(df.index[0], df.index[-1], freq=native_frequency),
+                        name=df.index.name
+                    )
+                )
 
-                # Convert to xarray Dataset and add basin string as additional coordinate
                 xr = xarray.Dataset.from_dataframe(df.astype(np.float32))
                 xr = xr.assign_coords({'basin': basin})
                 data_list.append(xr)
 
             if not data_list:
-                # If no period for no basin has defined timeslices, raise error.
                 if self.is_train:
                     raise NoTrainDataError
                 else:
                     raise NoEvaluationDataError
 
-            # create one large dataset that has two coordinates: datetime and basin
             xr = xarray.concat(data_list, dim="basin")
 
             if self.is_train and self.cfg.save_train_data:
@@ -532,25 +548,18 @@ class BaseDataset(Dataset):
         return xr
 
     def _save_xarray_dataset(self, xr: xarray.Dataset):
-        """Store newly created train data set to disk"""
         file_path = self.cfg.train_dir / "train_data.p"
-
         file_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # netCDF has issues with storing variables with '/' in the var names. Solution: convert to dict, then pickle
         with file_path.open("wb") as fp:
             pickle.dump(xr.to_dict(), fp)
 
     def _calculate_per_basin_std(self, xr: xarray.Dataset):
-        basin_coordinates = xr["basin"].values.tolist()
         if not self._disable_pbar:
             LOGGER.info("Calculating target variable stds per basin")
         nan_basins = []
         for basin in tqdm(self.basins, file=sys.stdout, disable=self._disable_pbar):
-
             obs = xr.sel(basin=basin)[self.cfg.target_variables].to_array().values
             if np.sum(~np.isnan(obs)) > 1:
-                # calculate std for each target
                 per_basin_target_stds = torch.tensor(np.expand_dims(np.nanstd(obs, axis=1), 0), dtype=torch.float32)
             else:
                 nan_basins.append(basin)
@@ -567,47 +576,42 @@ class BaseDataset(Dataset):
         if not self._disable_pbar:
             LOGGER.info("Create lookup table and convert to pytorch tensor")
 
-        # list to collect basins ids of basins without a single training sample
         basins_without_samples = []
         basin_coordinates = xr["basin"].values.tolist()
         for basin in tqdm(basin_coordinates, file=sys.stdout, disable=self._disable_pbar):
 
-            # store data of each frequency as numpy array of shape [time steps, features] and dates as numpy array of
-            # shape (time steps,)
             x_d, x_s, y, dates = {}, {}, {}, {}
-
-            # keys: frequencies, values: array mapping each lowest-frequency
-            # sample to its corresponding sample in this frequency
             frequency_maps = {}
             lowest_freq = utils.sort_frequencies(self.frequencies)[0]
 
-            # converting from xarray to pandas DataFrame because resampling is much faster in pandas.
             df_native = xr.sel(basin=basin).to_dataframe()
+
             for freq in self.frequencies:
-                # make sure that possible mass inputs are sorted to the beginning of the dynamic feature list
                 if isinstance(self.cfg.dynamic_inputs, list):
                     dynamic_cols = self.cfg.mass_inputs + self.cfg.dynamic_inputs_flattened
                 else:
                     dynamic_cols = self.cfg.mass_inputs + self.cfg.dynamic_inputs[freq]
 
-                # add the dynamic_conceptual columns
                 dynamic_cols += self.cfg.dynamic_conceptual_inputs
 
-                df_resampled = df_native[dynamic_cols + self.cfg.target_variables + self.cfg.evolving_attributes +
-                                         self.cfg.autoregressive_inputs].resample(freq).mean()
+                all_cols = dynamic_cols + self.cfg.target_variables + self.cfg.evolving_attributes + self.cfg.autoregressive_inputs
 
-                # pull all of the data that needs to be validated
+                # per-column aggregation (sum for sum_variables, mean for others)
+                agg = {c: "mean" for c in all_cols}
+                for c in self.sum_variables:
+                    if c in agg:
+                        agg[c] = "sum"
+
+                df_resampled = df_native[all_cols].resample(freq).agg(agg)
+
                 x_d[freq] = {col: df_resampled[[col]].values for col in dynamic_cols}
                 y[freq] = df_resampled[self.cfg.target_variables].values
                 if self.cfg.evolving_attributes:
                     x_s[freq] = df_resampled[self.cfg.evolving_attributes].values
 
-                # Add dates of the (resampled) data to the dates dict
                 dates[freq] = df_resampled.index.to_numpy()
 
-                # number of frequency steps in one lowest-frequency step
                 frequency_factor = int(utils.get_frequency_factor(lowest_freq, freq))
-                # array position i is the last entry of this frequency that belongs to the lowest-frequency sample i.
                 if len(df_resampled) % frequency_factor != 0:
                     raise ValueError(f'The length of the dataframe at frequency {freq} is {len(df_resampled)} '
                                      f'(including warmup), which is not a multiple of {frequency_factor} (i.e., the '
@@ -617,57 +621,39 @@ class BaseDataset(Dataset):
                 frequency_maps[freq] = np.arange(len(df_resampled) // frequency_factor) \
                                        * frequency_factor + (frequency_factor - 1)
 
-            # store first date of sequence to be able to restore dates during inference
             if not self.is_train:
                 self.period_starts[basin] = pd.to_datetime(xr.sel(basin=basin)["date"].values[0])
 
-            # we can ignore the deprecation warning about lists because we don't use the passed lists
-            # after the _validate_samples call. The alternative numba.typed.Lists is still experimental.
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore', category=NumbaPendingDeprecationWarning)
-
-                # checks inputs and outputs for each sequence. valid: flag = 1, invalid: flag = 0
-                # manually unroll the dicts into lists to make sure the order of frequencies is consistent.
-                # during inference, we want all samples with sufficient history (even if input is NaN), so
-                # we pass x_d, x_s, y as None.
                 if self.is_train:
                     x_d_validate = [np.concatenate([v for v in x_d[freq].values()], axis=-1)
                                     for freq in self.frequencies]
                 else:
                     x_d_validate = None
-                flag = _validate_samples(x_d=x_d_validate,
-                                        x_s=[x_s[freq] for freq in self.frequencies] if self.is_train and x_s else None,
-                                        y=[y[freq] for freq in self.frequencies] if self.is_train else None,
-                                        frequency_maps=[frequency_maps[freq] for freq in self.frequencies],
-                                        seq_length=self.seq_len,
-                                        predict_last_n=self._predict_last_n)
+                flag = _validate_samples(
+                    x_d=x_d_validate,
+                    x_s=[x_s[freq] for freq in self.frequencies] if self.is_train and x_s else None,
+                    y=[y[freq] for freq in self.frequencies] if self.is_train else None,
+                    frequency_maps=[frequency_maps[freq] for freq in self.frequencies],
+                    seq_length=self.seq_len,
+                    predict_last_n=self._predict_last_n
+                )
 
-            # Concatenate autoregressive columns to dynamic inputs *after* validation, so as to not remove
-            # samples with missing autoregressive inputs.
-            # AR inputs must go at the end of the df/array (this is assumed by the AR model).
             if self.cfg.autoregressive_inputs:
                 if len(self.frequencies) > 1:
-                    # We'd need to store the df_resampled for each frequency separately to make this work.
                     raise ValueError('Autoregressive inputs are not supported for datasets with multiple frequencies.')
                 x_d[self.frequencies[0]].update({col: df_resampled[[col]].values
                                                  for col in self.cfg.autoregressive_inputs})
 
-            # indices (in lowest-frequency steps) where the sample is valid
             valid_samples = np.argwhere(flag == 1).flatten()
 
-            # --------------------------------------------------------------
-            # Optional thinning / non-overlapping sampling
-            # For persistent LSTM (single frequency) we typically want stride
-            # >= seq_len[0] so that windows do not overlap in time.
-            # --------------------------------------------------------------
             if self.non_overlapping_sequences:
                 if len(self.frequencies) != 1:
-                    raise ValueError(
-                        "non_overlapping_sequences is currently only supported for single-frequency datasets.")
+                    raise ValueError("non_overlapping_sequences is currently only supported for single-frequency datasets.")
                 stride = int(self.seq_stride)
                 if stride <= 0:
                     raise ValueError("seq_stride must be a positive integer.")
-                # If user left seq_stride=1, default to full sequence length for non-overlapping windows
                 if stride == 1:
                     stride = int(self.seq_len[0])
                 valid_samples = valid_samples[::stride]
@@ -677,16 +663,9 @@ class BaseDataset(Dataset):
                     raise ValueError("seq_stride must be a positive integer.")
                 valid_samples = valid_samples[::stride]
 
-            # store pointer to basin and the sample's index in each frequency
             for f in valid_samples:
                 lookup.append((basin, [frequency_maps[freq][int(f)] for freq in self.frequencies]))
 
-            #valid_samples = np.argwhere(flag == 1)
-            #for f in valid_samples:
-                # store pointer to basin and the sample's index in each frequency
-               # lookup.append((basin, [frequency_maps[freq][int(f)] for freq in self.frequencies]))
-
-            # only store data if this basin has at least one valid sample in the given period
             if valid_samples.size > 0:
                 if self.cfg.forecast_inputs_flattened and not self.cfg.hindcast_inputs_flattened:
                     raise ValueError('Hindcast inputs must be provided if forecast inputs are provided.')
@@ -701,8 +680,8 @@ class BaseDataset(Dataset):
                 basins_without_samples.append(basin)
 
         if basins_without_samples:
-            LOGGER.info(
-                f"These basins do not have a single valid sample in the {self.period} period: {basins_without_samples}")
+            LOGGER.info(f"These basins do not have a single valid sample in the {self.period} period: {basins_without_samples}")
+
         self.lookup_table = {i: elem for i, elem in enumerate(lookup)}
         self.num_samples = len(self.lookup_table)
 
@@ -714,101 +693,69 @@ class BaseDataset(Dataset):
 
     def _load_hydroatlas_attributes(self):
         df = utils.load_hydroatlas_attributes(self.cfg.data_dir, basins=self.basins)
-
-        # remove all attributes not defined in the config
         drop_cols = [c for c in df.columns if c not in self.cfg.hydroatlas_attributes]
         df = df.drop(drop_cols, axis=1)
-
         if self.is_train:
-            # sanity check attributes for NaN in per-feature standard deviation
             utils.attributes_sanity_check(df=df)
-
         return df
 
     def _load_combined_attributes(self):
-        """This function loads data set specific attributes and combines them with hydroatlas attributes"""
         dfs = []
-
-        # load dataset specific attributes from the subclass
         if self.cfg.static_attributes:
             df = self._load_attributes()
-
-            # remove all attributes not defined in the config
             missing_attrs = [attr for attr in self.cfg.static_attributes if attr not in df.columns]
             if len(missing_attrs) > 0:
                 raise ValueError(f'Static attributes {missing_attrs} are missing.')
             df = df[self.cfg.static_attributes]
-
-            # in case of training (not finetuning) check for NaNs in feature std.
             if self._compute_scaler:
                 utils.attributes_sanity_check(df=df)
-
             dfs.append(df)
 
-        # Hydroatlas attributes can be used everywhere
         if self.cfg.hydroatlas_attributes:
             dfs.append(self._load_hydroatlas_attributes())
 
         if dfs:
-            # combine all attributes into a single dataframe
             df = pd.concat(dfs, axis=1)
-
-            # check if any attribute specified in the config is not available in the dataframes
             combined_attributes = self.cfg.static_attributes + self.cfg.hydroatlas_attributes
             missing_columns = [attr for attr in combined_attributes if attr not in df.columns]
             if missing_columns:
                 raise ValueError(f"The following attributes are not available in the dataset: {missing_columns}")
 
-            # fix the order of the columns to be alphabetically
             df = df.sort_index(axis=1)
 
-            # calculate statistics and normalize features
             if self._compute_scaler:
                 self.scaler["attribute_means"] = df.mean()
                 self.scaler["attribute_stds"] = df.std()
 
             if any([k.startswith("camels_attr") for k in self.scaler.keys()]):
-                LOGGER.warning(
-                    "Deprecation warning: Using old scaler files won't be supported in the upcoming release.")
-
-                # Here we assume that only camels attributes are used
+                LOGGER.warning("Deprecation warning: Using old scaler files won't be supported in the upcoming release.")
                 df = (df - self.scaler['camels_attr_means']) / self.scaler["camels_attr_stds"]
             else:
                 df = (df - self.scaler['attribute_means']) / self.scaler["attribute_stds"]
 
-            # preprocess each basin feature vector as pytorch tensor
             for basin in self.basins:
                 attributes = df.loc[df.index == basin].values.flatten()
                 self._attributes[basin] = torch.from_numpy(attributes.astype(np.float32))
 
     def _load_data(self):
-        # load attributes first to sanity-check those features before doing the compute expensive time series loading
         self._load_combined_attributes()
-
         xr = self._load_or_create_xarray_dataset()
 
         if self.cfg.loss.lower() in ['nse', 'weightednse']:
-            # get the std of the discharge for each basin, which is needed for the (weighted) NSE loss.
             self._calculate_per_basin_std(xr)
 
         if self._compute_scaler:
-            # get feature-wise center and scale values for the feature normalization
             self._setup_normalization(xr)
 
-        # performs normalization
         xr = (xr - self.scaler["xarray_feature_center"]) / self.scaler["xarray_feature_scale"]
-
         self._create_lookup_table(xr)
 
     def _setup_normalization(self, xr: xarray.Dataset):
-        # default center and scale values are feature mean and std
         self.scaler["xarray_feature_scale"] = xr.std(skipna=True)
         self.scaler["xarray_feature_center"] = xr.mean(skipna=True)
 
-        # check for feature-wise custom normalization
         for feature, feature_specs in self.cfg.custom_normalization.items():
             for key, val in feature_specs.items():
-                # check for custom treatment of the feature center
                 if key == "centering":
                     if (val is None) or (val.lower() == "none"):
                         self.scaler["xarray_feature_center"][feature] = np.float32(0.0)
@@ -817,48 +764,27 @@ class BaseDataset(Dataset):
                     elif val.lower() == "min":
                         self.scaler["xarray_feature_center"][feature] = xr[feature].min(skipna=True)
                     elif val.lower() == "mean":
-                        # Do nothing, since this is the default
                         pass
                     else:
                         raise ValueError(f"Unknown centering method {val}")
 
-                # check for custom treatment of the feature scale
                 elif key == "scaling":
                     if (val is None) or (val.lower() == "none"):
                         self.scaler["xarray_feature_scale"][feature] = np.float32(1.0)
                     elif val == "minmax":
-                        self.scaler["xarray_feature_scale"][feature] = xr[feature].max(skipna=True) - \
-                                                                       xr[feature].min(skipna=True)
+                        self.scaler["xarray_feature_scale"][feature] = xr[feature].max(skipna=True) - xr[feature].min(skipna=True)
                     elif val == "std":
-                        # Do nothing, since this is the default
                         pass
                     else:
                         raise ValueError(f"Unknown scaling method {val}")
                 else:
-                    # raise ValueError to point to the correct argument names
                     raise ValueError("Unknown dict key. Use 'centering' and/or 'scaling' for each feature.")
 
     def get_period_start(self, basin: str) -> pd.Timestamp:
-        """Return the first date in the period for a given basin
-        
-        Parameters
-        ----------
-        basin : str
-            The basin id
-
-        Returns
-        -------
-        pd.Timestamp
-            First date in the period for the specific basin. Necessary during evaluation to restore the dates.
-        """
         return self.period_starts[basin]
 
     def _initialize_frequency_configuration(self):
-        """Checks and extracts configuration values for 'use_frequency', 'seq_length', and 'predict_last_n'"""
-
-        # If use_frequencies is not supplied, we'll fill it with the native frequency while loading the df.
         self.frequencies = self.cfg.use_frequencies
-
         self.seq_len = self.cfg.seq_length
         self._predict_last_n = self.cfg.predict_last_n
         if not self.frequencies:
@@ -867,9 +793,7 @@ class BaseDataset(Dataset):
             self.seq_len = [self.seq_len]
             self._predict_last_n = [self._predict_last_n]
         else:
-            # flatten per-frequency dictionaries into lists that are ordered as use_frequencies
-            if not isinstance(self.seq_len, dict) \
-                    or not isinstance(self._predict_last_n, dict) \
+            if not isinstance(self.seq_len, dict) or not isinstance(self._predict_last_n, dict) \
                     or any([freq not in self.seq_len for freq in self.frequencies]) \
                     or any([freq not in self._predict_last_n for freq in self.frequencies]):
                 raise ValueError('seq_length and predict_last_n must be dictionaries with one key per frequency.')
@@ -877,81 +801,47 @@ class BaseDataset(Dataset):
             self._predict_last_n = [self._predict_last_n[freq] for freq in self.frequencies]
 
     @staticmethod
-    def collate_fn(
-            samples: List[Dict[str, Union[torch.Tensor, np.ndarray, Dict[str, torch.Tensor]]]]
-    ) -> Dict[str, Union[torch.Tensor, np.ndarray, Dict[str, torch.Tensor]]]:
+    def collate_fn(samples: List[Dict[str, Union[torch.Tensor, np.ndarray, Dict[str, torch.Tensor]]]]
+                   ) -> Dict[str, Union[torch.Tensor, np.ndarray, Dict[str, torch.Tensor]]]:
         batch = {}
         if not samples:
             return batch
         features = list(samples[0].keys())
         for feature in features:
             if feature.startswith('date'):
-                # Dates are stored as a numpy array of datetime64, which we maintain as numpy array.
                 batch[feature] = np.stack([sample[feature] for sample in samples], axis=0)
             elif feature.startswith('x_d'):
-                # Dynamics are stored as dictionaries with feature names as keys.
                 batch[feature] = {k: torch.stack([sample[feature][k] for sample in samples], dim=0)
                                   for k in samples[0][feature]}
             else:
-                # Everything else is a torch.Tensor.
                 batch[feature] = torch.stack([sample[feature] for sample in samples], dim=0)
         return batch
 
 
 @njit()
 def _validate_samples(x_d: List[np.ndarray], x_s: List[np.ndarray], y: List[np.ndarray], seq_length: List[int],
-                     predict_last_n: List[int], frequency_maps: List[np.ndarray]) -> np.ndarray:
-    """Checks for invalid samples due to NaN or insufficient sequence length.
-
-    Parameters
-    ----------
-    x_d : List[np.ndarray]
-        List of dynamic input data; one entry per frequency
-    x_s : List[np.ndarray]
-        List of additional static input data; one entry per frequency
-    y : List[np.ndarray]
-        List of target values; one entry per frequency
-    seq_length : List[int]
-        List of sequence lengths; one entry per frequency
-    predict_last_n: List[int]
-        List of predict_last_n; one entry per frequency
-    frequency_maps : List[np.ndarray]
-        List of arrays mapping lowest-frequency samples to their corresponding last sample in each frequency;
-         one list entry per frequency.
-
-    Returns
-    -------
-    np.ndarray 
-        Array has a value of 1 for valid samples and a value of 0 for invalid samples.
-    """
-    # number of samples is number of lowest-frequency samples (all maps have this length)
+                      predict_last_n: List[int], frequency_maps: List[np.ndarray]) -> np.ndarray:
     n_samples = len(frequency_maps[0])
-
-    # 1 denote valid sample, 0 denote invalid sample
     flag = np.ones(n_samples)
-    for i in range(len(frequency_maps)):  # iterate through frequencies
-        for j in prange(n_samples):  # iterate through lowest-frequency samples
-            # find the last sample in this frequency that belongs to the lowest-frequency step j
+    for i in range(len(frequency_maps)):
+        for j in prange(n_samples):
             last_sample_of_freq = frequency_maps[i][j]
             if last_sample_of_freq < seq_length[i] - 1:
-                flag[j] = 0  # too early for this frequency's seq_length (not enough history)
+                flag[j] = 0
                 continue
 
-            # any NaN in the dynamic inputs makes the sample invalid
             if x_d is not None:
                 _x_d = x_d[i][last_sample_of_freq - seq_length[i] + 1:last_sample_of_freq + 1]
                 if np.any(np.isnan(_x_d)):
                     flag[j] = 0
                     continue
 
-            # all-NaN in the targets makes the sample invalid
             if y is not None:
                 _y = y[i][last_sample_of_freq - predict_last_n[i] + 1:last_sample_of_freq + 1]
                 if np.prod(np.array(_y.shape)) > 0 and np.all(np.isnan(_y)):
                     flag[j] = 0
                     continue
 
-            # any NaN in the static features makes the sample invalid
             if x_s is not None:
                 _x_s = x_s[i][last_sample_of_freq]
                 if np.any(np.isnan(_x_s)):
