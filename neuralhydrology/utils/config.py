@@ -124,6 +124,33 @@ class Config(object):
             return value
         else:
             return [value]
+    
+        # ==================================================================
+    # NEW: frequency conversion / resampling support
+    # ==================================================================
+    @property
+    def run_frequency(self) -> Optional[str]:
+        """
+        Optional frequency that the dataset should be converted to before resampling/use_frequencies is applied.
+
+        Examples:
+          - "1H"     (hourly)
+          - "15min"  (15-minute)
+          - None     (no conversion; use native index frequency)
+        """
+        freq = self._cfg.get("run_frequency", None)
+        if freq is None or str(freq).lower() in ["none", "null", ""]:
+            return None
+        return str(freq)
+
+    @property
+    def sum_variables(self) -> List[str]:
+        """
+        Variables treated as 'accumulated per timestep' (sum-type) when changing frequency.
+        Example: precipitation amount per timestep.
+        """
+        return self._as_default_list(self._cfg.get("sum_variables", []))
+
 
     @staticmethod
     def _as_default_dict(value: Any) -> dict:
