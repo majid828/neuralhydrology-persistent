@@ -42,6 +42,7 @@ output_dropout: 0.3   # reduced (0.4 often hurts)
 persistent_state: true
 
 nan_handling_method: masked
+
 # --- Evaluation warm-up (spin-up) -----------------------------------------------------------------
 eval_warmup_steps: 0
 
@@ -76,14 +77,30 @@ save_validation_results: False
 dataset: hourly_camels_us
 data_dir: ./test/test_data/camels_us
 forcings: nldas_hourly
+
+# NEW: choose the run frequency here
+# - "1h"   for hourly
+# - "15min" for 15-minute
+run_frequency: "1h"
+
 dynamic_inputs:
   - total_precipitation
   - temperature
+
 target_variables:
   - qobs_mm_per_hour
+
 static_attributes:
   - elev_mean
   - slope_mean
+
+# NEW: list of accumulated variables (sum-type) that must be split/summed when changing frequency.
+# In your test dataset, "total_precipitation" is almost certainly accumulated amount per step.
+# Also, your target name "qobs_mm_per_hour" suggests an accumulated depth per hour; treat it as sum-type.
+sum_variables:
+  - total_precipitation
+  - qobs_mm_per_hour
+
 
 # --- Persistent sampling configuration ------------------------------------------------------------
 # If you want strict non-overlapping time blocks (good for persistent hidden state logic)
