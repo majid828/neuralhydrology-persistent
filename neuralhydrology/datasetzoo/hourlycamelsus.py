@@ -14,34 +14,14 @@ LOGGER = logging.getLogger(__name__)
 
 class HourlyCamelsUS(camelsus.CamelsUS):
     """Data set class providing hourly data for CAMELS US basins.
-    
-    This class extends the `CamelsUS` dataset class by hourly in- and output data. Currently, only NLDAS forcings are
-    available at an hourly resolution.
 
-    Parameters
-    ----------
-    cfg : Config
-        The run configuration.
-    is_train : bool
-        Defines if the dataset is used for training or evaluating. If True (training), means/stds for each feature
-        are computed and stored to the run directory. If one-hot encoding is used, the mapping for the one-hot encoding
-        is created and also stored to disk. If False, a `scaler` input is expected and similarly the `id_to_int` input
-        if one-hot encoding is used.
-    period : {'train', 'validation', 'test'}
-        Defines the period for which the data will be loaded
-    basin : str, optional
-        If passed, the data for only this basin will be loaded. Otherwise the basin(s) are read from the appropriate
-        basin file, corresponding to the `period`.
-    additional_features : List[Dict[str, pd.DataFrame]], optional
-        List of dictionaries, mapping from a basin id to a pandas DataFrame. This DataFrame will be added to the data
-        loaded from the dataset and all columns are available as 'dynamic_inputs', 'evolving_attributes' and
-        'target_variables'
-    id_to_int : Dict[str, int], optional
-        If the config argument 'use_basin_id_encoding' is True in the config and period is either 'validation' or
-        'test', this input is required. It is a dictionary, mapping from basin id to an integer (the one-hot encoding).
-    scaler : Dict[str, Union[pd.Series, xarray.DataArray]], optional
-        If period is either 'validation' or 'test', this input is required. It contains the centering and scaling
-        for each feature and is stored to the run directory during training (train_data/train_data_scaler.yml).
+    MODIFICATION (15-min support):
+    - If the run requests 15-minute frequency (cfg.use_frequencies contains '15min'),
+      then we:
+        1) load HOURLY forcings (as before),
+        2) upsample forcings to 15-min by repeating each hourly value 4 times (ffill),
+        3) split APCP_surface into 4 equal 15-min portions (divide by 4),
+        4) load TRUE 15-min QObs as the target and join to the 15-min forcing dataframe.
     """
 
     def __init__(self,
@@ -62,26 +42,63 @@ class HourlyCamelsUS(camelsus.CamelsUS):
                                              id_to_int=id_to_int,
                                              scaler=scaler)
 
+    # ---------------------------
+    # Helper: detect 15-min mode
+    # ---------------------------
+    def _is_15min_run(self) -> bool:
+        """Return True if the run requests a 15-minute frequency."""
+        freqs = getattr(self.cfg, "use_frequencies", None)
+        if not freqs:
+            return False
+        # Normalize to strings (cfg may store offsets, strings, etc.)
+        freqs_str = [str(f).lower() for f in freqs]
+        return any(("15min" in f) or (f == "15t") for f in freqs_str)
+
     def _load_basin_data(self, basin: str) -> pd.DataFrame:
-        """Load input and output data from text files."""
-        # get forcings
+        """Load input and output data.
+
+        HOURLY mode (unchanged behavior):
+          - Load hourly forcings + hourly discharge (qobs) from hourly CAMELS-US.
+
+        15-min mode (new behavior):
+          - Load HOURLY forcings (do NOT rely on hourly qobs),
+          - Upsample forcings to 15-min by repeating values (ffill),
+          - Divide APCP_surface by 4 (hourly total -> four 15-min totals),
+          - Join TRUE 15-min QObs target from /mnt/disk1/CAMELS_US/15min.
+        """
+        run_15min = self._is_15min_run()
+
+        # -------------------------
+        # 1) Load FORCINGS (hourly)
+        # -------------------------
         dfs = []
         if not any(f.endswith('_hourly') for f in self.cfg.forcings):
             raise ValueError('Forcings include no hourly forcings set.')
+
         for forcing in self.cfg.forcings:
-            if forcing[-7:] == '_hourly':
-                df = self.load_hourly_data(basin, forcing)
+            if forcing.endswith('_hourly'):
+                # In 15-min mode, we DO NOT need hourly discharge, because we will load 15-min QObs.
+                df = self.load_hourly_data(basin, forcing, load_discharge=not run_15min)
             else:
-                # load daily CAMELS forcings and upsample to hourly
+                # Load daily CAMELS forcings and upsample to hourly (repeat each daily value across hours)
                 df, _ = camelsus.load_camels_us_forcings(self.cfg.data_dir, basin, forcing)
                 df = df.resample('1h').ffill()
+
+            # If multiple forcing products are used, rename columns to keep them unique.
             if len(self.cfg.forcings) > 1:
-                # rename columns
-                df = df.rename(columns={col: f"{col}_{forcing}" for col in df.columns if 'qobs' not in col.lower()})
+                df = df.rename(columns={
+                    col: f"{col}_{forcing}" for col in df.columns if 'qobs' not in col.lower()
+                })
             dfs.append(df)
+
+        # Combine all forcing dfs into one dataframe (columns = all features).
         df = pd.concat(dfs, axis=1)
 
-        # collapse all input features to a single list, to check for 'QObs(mm/d)'.
+        # --------------------------------------------
+        # 2) Optionally add daily discharge QObs(mm/d)
+        # --------------------------------------------
+        # This block is from original code; keep it.
+        # It is unrelated to the 15-min QObs(mm/h) target.
         all_features = self.cfg.target_variables
         if isinstance(self.cfg.dynamic_inputs, dict):
             for val in self.cfg.dynamic_inputs.values():
@@ -94,48 +111,74 @@ class HourlyCamelsUS(camelsus.CamelsUS):
             # add daily discharge from CAMELS, using daymet to get basin area
             _, area = camelsus.load_camels_us_forcings(self.cfg.data_dir, basin, "daymet")
             discharge = camelsus.load_camels_us_discharge(self.cfg.data_dir, basin, area)
-            discharge = discharge.resample('1h').ffill()
+            discharge = discharge.resample('1h').ffill()  # repeat daily to hourly
             df["QObs(mm/d)"] = discharge
 
         # only warn for missing netcdf files once for each forcing product
         self._warn_slow_loading = False
 
-        # replace invalid discharge values by NaNs
+        # ------------------------------------------
+        # 3) Clean invalid discharge values (hourly)
+        # ------------------------------------------
+        # In 15-min mode, hourly qobs might be absent (we skipped it), but this is safe.
         qobs_cols = [col for col in df.columns if 'qobs' in col.lower()]
         for col in qobs_cols:
             df.loc[df[col] < 0, col] = np.nan
 
-        # add stage, if requested
+        # -------------------------------------------------
+        # 4) Optional: stage (kept as original behavior)
+        # -------------------------------------------------
         if 'gauge_height_m' in self.cfg.target_variables:
             df = df.join(load_hourly_us_stage(self.cfg.data_dir, basin))
             df.loc[df['gauge_height_m'] < 0, 'gauge_height_m'] = np.nan
 
-        # convert discharge to 'synthetic' stage, if requested
+        # ----------------------------------------------------------
+        # 5) Optional: synthetic stage (kept as original behavior)
+        # ----------------------------------------------------------
         if 'synthetic_qobs_stage_meters' in self.cfg.target_variables:
             attributes = camelsus.load_camels_us_attributes(data_dir=self.cfg.data_dir, basins=[basin])
             with open(self.cfg.rating_curve_file, 'rb') as f:
                 rating_curves = pickle.load(f)
             df['synthetic_qobs_stage_meters'] = np.nan
             if basin in rating_curves.keys():
+                # Uses hourly qobs in mm/hour -> converts to m3/s using basin area
                 discharge_m3s = df['qobs_mm_per_hour'].values / 1000 * attributes.area_gages2[basin] * 1e6 / 60**2
                 df['synthetic_qobs_stage_meters'] = rating_curves[basin].discharge_to_stage(discharge_m3s)
 
+        # ==========================================================
+        # 6) NEW: 15-min mode conversion (THIS IS YOUR MAIN CHANGE)
+        # ==========================================================
+        if run_15min:
+            # (a) Upsample hourly forcings to 15-min by repeating each hourly value 4 times.
+            #     Example: if TMP at 01:00 is X, then 01:00, 01:15, 01:30, 01:45 will all be X.
+            df = df.resample("15min").ffill()
+
+            # (b) Split hourly precipitation accumulation into four equal 15-min chunks.
+            #     Example: if APCP_surface at 01:00 is 4 mm/hour total, then each 15-min step gets 1 mm.
+            if "APCP_surface" in df.columns:
+                df["APCP_surface"] = df["APCP_surface"] / 4.0
+
+            # (c) Load TRUE 15-min discharge (QObs) and join to the dataframe.
+            #     This ensures your target really is 15-min, not hourly repeated.
+            q15 = load_15min_us_discharge(Path("/mnt/disk1/CAMELS_US/15min"), basin)
+
+            # Inner join keeps only timestamps where both forcings and QObs exist.
+            df = df.join(q15, how="inner")
+
+            # (d) Replace invalid discharge values with NaNs (same rule as hourly)
+            qobs_15_cols = [col for col in df.columns if 'qobs' in col.lower()]
+            for col in qobs_15_cols:
+                df.loc[df[col] < 0, col] = np.nan
+
         return df
 
-    def load_hourly_data(self, basin: str, forcings: str) -> pd.DataFrame:
-        """Load a single set of hourly forcings and discharge. If available, loads from NetCDF, else from csv.
-        
-        Parameters
-        ----------
-        basin : str
-            Identifier of the basin for which to load data.
-        forcings : str
-            Name of the forcings set to load.
+    def load_hourly_data(self, basin: str, forcings: str, load_discharge: bool = True) -> pd.DataFrame:
+        """Load a single set of hourly forcings (and optionally hourly discharge).
 
-        Returns
-        -------
-        pd.DataFrame
-            Time-indexed DataFrame with forcings and discharge values for the specified basin.
+        MODIFICATION:
+        - Added parameter load_discharge:
+            * hourly run: load_discharge=True (original behavior)
+            * 15-min run: load_discharge=False (we will load true 15-min QObs later)
         """
         fallback_csv = False
         try:
@@ -151,37 +194,61 @@ class HourlyCamelsUS(camelsus.CamelsUS):
             fallback_csv = True
             LOGGER.warning(
                 f'## Warning: NetCDF file of {forcings} does not contain data for {basin}. Trying slower csv files.')
+
         if fallback_csv:
             df = load_hourly_us_forcings(self.cfg.data_dir, basin, forcings)
 
-            # add discharge
-            df = df.join(load_hourly_us_discharge(self.cfg.data_dir, basin))
+            # Only add hourly discharge if requested.
+            if load_discharge:
+                df = df.join(load_hourly_us_discharge(self.cfg.data_dir, basin))
 
         return df
 
 
-def load_hourly_us_forcings(data_dir: Path, basin: str, forcings: str) -> pd.DataFrame:
-    """Load the hourly forcing data for a basin of the CAMELS US data set.
+# ==========================================================
+# NEW helper: load 15-min QObs (YOU MUST ADAPT THIS FUNCTION)
+# ==========================================================
+def load_15min_us_discharge(data_dir_15min: Path, basin: str) -> pd.DataFrame:
+    """Load 15-min discharge (QObs) for a basin.
 
-    The hourly forcings are not included in the original data set by Newman et al. (2017).
-
-    Parameters
-    ----------
-    data_dir : Path
-        Path to the CAMELS US directory. This folder must contain an 'hourly' folder containing one subdirectory
-        for each forcing, which contains the forcing files (.csv) for each basin. Files have to contain the 8-digit 
-        basin id.
-        If using AORC forcing data, add these to the 'hourly' folder: https://doi.org/10.4211/hs.c738c05278a34bc9848dd14d61cffab9
-    basin : str
-        8-digit USGS identifier of the basin.
-    forcings : str
-        Must match the folder names in the 'hourly' directory. E.g. 'nldas_hourly'
-
-    Returns
-    -------
-    pd.DataFrame
-        Time-indexed DataFrame, containing the forcing data.
+    IMPORTANT:
+    - I cannot hard-code the exact filename pattern/column name because you haven't shown the file layout yet.
+    - You must adapt:
+        1) where files are located under /mnt/disk1/CAMELS_US/15min
+        2) the filename pattern (e.g., *.csv) and how basin id appears in the name
+        3) the datetime column name
+        4) the discharge column name (should match YAML target_variables)
     """
+    # TODO: Update this pattern to match your 15-min files.
+    # Example patterns could be:
+    #   pattern = "**/*15min*.csv"
+    #   pattern = "**/*usgs-15min.csv"
+    pattern = "**/*.csv"
+
+    files = list(data_dir_15min.glob(pattern))
+    file_path = [f for f in files if basin in f.stem]
+    if file_path:
+        file_path = file_path[0]
+    else:
+        raise FileNotFoundError(f"No 15-min QObs file found for basin {basin} under {data_dir_15min}")
+
+    # TODO: Update index_col and parse_dates to match your file.
+    # Common possibilities: index_col='date' or index_col='time' or index_col='datetime'
+    df = pd.read_csv(file_path, index_col=['date'], parse_dates=['date'])
+
+    # TODO: Ensure the column name matches your YAML target_variables.
+    # If the file column is qobs_mm_per_hour but your YAML uses QObs(mm/h),
+    # rename here so NH sees the expected target name.
+    #
+    # Example:
+    # if 'qobs_mm_per_hour' in df.columns:
+    #     df = df.rename(columns={'qobs_mm_per_hour': 'QObs(mm/h)'})
+
+    return df
+
+
+def load_hourly_us_forcings(data_dir: Path, basin: str, forcings: str) -> pd.DataFrame:
+    """Load the hourly forcing data for a basin of the CAMELS US data set."""
     forcing_path = data_dir / 'hourly' / forcings
     if not forcing_path.is_dir():
         raise OSError(f"{forcing_path} does not exist")
@@ -207,32 +274,16 @@ def load_hourly_us_forcings(data_dir: Path, basin: str, forcings: str) -> pd.Dat
 
 
 def load_hourly_us_discharge(data_dir: Path, basin: str) -> pd.DataFrame:
-    """Load the hourly discharge data for a basin of the CAMELS US data set.
-
-    Parameters
-    ----------
-    data_dir : Path
-        Path to the CAMELS US directory. This folder must contain a folder called 'hourly' with a subdirectory 
-        'usgs_streamflow' which contains the discharge files (.csv) for each basin. File names must contain the 8-digit 
-        basin id.
-    basin : str
-        8-digit USGS identifier of the basin.
-
-    Returns
-    -------
-    pd.Series
-        Time-index Series of the discharge values (mm/hour)
-    """
+    """Load the hourly discharge data for a basin of the CAMELS US data set."""
     pattern = '**/*usgs-hourly.csv'
     discharge_path = data_dir / 'hourly' / 'usgs_streamflow'
     files = list(discharge_path.glob(pattern))
-    
-    # https://github.com/neuralhydrology/neuralhydrology/issues/67 streamflow folder names are different in code
-    # vs. on Zenodo. We allow both ("-", "_") to not break any existing data directories.
+
+    # allow both folder naming variants
     if len(files) == 0:
         discharge_path = discharge_path.parent / 'usgs-streamflow'
         files = list(discharge_path.glob(pattern))
-    
+
     file_path = [f for f in files if basin in f.stem]
     if file_path:
         file_path = file_path[0]
@@ -243,21 +294,7 @@ def load_hourly_us_discharge(data_dir: Path, basin: str) -> pd.DataFrame:
 
 
 def load_hourly_us_stage(data_dir: Path, basin: str) -> pd.Series:
-    """Load the hourly stage data for a basin of the CAMELS US data set.
-
-    Parameters
-    ----------
-    data_dir : Path
-        Path to the CAMELS US directory. This folder must contain a folder called 'hourly' with a subdirectory 
-        'usgs_stage' which contains the stage files (.csv) for each basin. File names must contain the 8-digit basin id.
-    basin : str
-        8-digit USGS identifier of the basin.
-
-    Returns
-    -------
-    pd.Series
-        Time-index Series of the stage values (m)
-    """
+    """Load the hourly stage data for a basin of the CAMELS US data set."""
     stage_path = data_dir / 'hourly' / 'usgs_stage'
     files = list(stage_path.glob('**/*_utc.csv'))
     file_path = [f for f in files if basin in f.stem]
@@ -278,21 +315,7 @@ def load_hourly_us_stage(data_dir: Path, basin: str) -> pd.Series:
 
 
 def load_hourly_us_netcdf(data_dir: Path, forcings: str) -> xarray.Dataset:
-    """Load hourly forcing and discharge data from preprocessed netCDF file.
-
-    Parameters
-    ----------
-    data_dir : Path
-        Path to the CAMELS US directory. This folder must contain a folder called 'hourly', containing the netCDF file.
-    forcings : str
-        Name of the forcing product. Must match the ending of the netCDF file. E.g. 'nldas_hourly' for 
-        'usgs-streamflow-nldas_hourly.nc'
-
-    Returns
-    -------
-    xarray.Dataset
-        Dataset containing the combined discharge and forcing data of all basins (as stored in the netCDF)  
-    """
+    """Load hourly forcing and discharge data from preprocessed netCDF file."""
     netcdf_path = data_dir / 'hourly' / f'usgs-streamflow-{forcings}.nc'
     if not netcdf_path.is_file():
         raise FileNotFoundError(f'No NetCDF file for hourly streamflow and {forcings} at {netcdf_path}.')
