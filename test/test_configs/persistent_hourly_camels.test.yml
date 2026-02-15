@@ -8,6 +8,10 @@ train_basin_file: ./test/test_data/4_basins_test_set.txt
 validation_basin_file: ./test/test_data/4_basins_test_set.txt
 test_basin_file: ./test/test_data/4_basins_test_set.txt
 
+#train_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP.txt
+#validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP.txt
+#test_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP.txt
+
 train_start_date: '01/01/2000'
 train_end_date: '31/12/2001'
 validation_start_date: '01/01/2002'
