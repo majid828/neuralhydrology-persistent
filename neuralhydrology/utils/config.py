@@ -211,6 +211,24 @@ class Config(object):
         cfg = Config._parse_config(cfg)
         return cfg
 
+
+    # ==========================================================
+    # NEW: Allow 15-min discharge directory key in YAML
+    # ==========================================================
+
+    @property
+    def qobs_15min_dir(self) -> Path:
+        """Directory containing 15-min discharge (target) data.
+
+        YAML usage:
+            qobs_15min_dir: /mnt/disk1/CAMELS_US/15min
+        """
+        val = self._cfg.get("qobs_15min_dir", None)
+
+        if val is not None:
+            return Path(val)
+
+        return self.data_dir / "15min"
     # ---------------------------------------------------------------------
     # Standard NH properties (unchanged from your "before changes" version)
     # ---------------------------------------------------------------------
