@@ -123,17 +123,17 @@ dynamic_inputs:
 
 target_variables:  ["qobs_cfs"]
 
-#static_attributes:
- # - ari_ix_mean
-  #- slp_dg_mean
-  #- centroid_y
-  #- ims_pc_mean
-  #- ele_mt_mean
-  #- snd_pct
-  #- cly_pct
-  #- for_pc_forest_sse
-  #- lka_pc_sse
-  #- areasqkm
+static_attributes:
+  - ari_ix_mean
+  - slp_dg_mean
+  - centroid_y
+  - ims_pc_mean
+  - ele_mt_mean
+  - snd_pct
+  - cly_pct
+  - for_pc_forest_sse
+  - lka_pc_sse
+  - areasqkm
 
 # --- Persistent sampling configuration ------------------------------------------------------------
 non_overlapping_sequences: true
