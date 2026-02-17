@@ -11,6 +11,7 @@ from neuralhydrology.datasetzoo.caravan import Caravan
 from neuralhydrology.datasetzoo.camelsind import CamelsIND
 from neuralhydrology.datasetzoo.genericdataset import GenericDataset
 from neuralhydrology.datasetzoo.hourlycamelsus import HourlyCamelsUS
+from neuralhydrology.datasetzoo.fifteenminutecamelsus import FifteenMinuteCamelsUS 
 from neuralhydrology.datasetzoo.lamah import LamaH
 from neuralhydrology.utils.config import Config
 from neuralhydrology.datasetzoo.datasetregistry import DatasetRegistry
@@ -104,6 +105,7 @@ _datasetZooRegistry.register_dataset_class("camels_gb", CamelsGB)
 _datasetZooRegistry.register_dataset_class("camels_aus", CamelsAUS)
 _datasetZooRegistry.register_dataset_class("camels_br", CamelsBR)
 _datasetZooRegistry.register_dataset_class("hourly_camels_us", HourlyCamelsUS)
+_datasetZooRegistry.register_dataset_class("fifteenmin_camels_us", FifteenMinuteCamelsUS)
 _datasetZooRegistry.register_dataset_class("camels_cl", CamelsCL)
 _datasetZooRegistry.register_dataset_class("generic", GenericDataset)
 _datasetZooRegistry.register_dataset_class("lamah_a", LamaH)
