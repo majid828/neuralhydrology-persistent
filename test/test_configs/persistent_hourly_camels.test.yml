@@ -1,4 +1,4 @@
-  GNU nano 6.2                                                                                                                                                                                                                                                                                        /home/mhshah1/configs/config_persistent.yml
+                                                                                                                                                                                                                                                                                      /home/mhshah1/configs/config_persistent.yml
 # --- Experiment cofigurations --------------------------------------------------------------------
 train_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP.txt
 validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP.txt
