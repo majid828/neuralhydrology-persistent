@@ -1,7 +1,7 @@
                                                                                                                                                                                                                                                                                       /home/mhshah1/configs/config_persistent.yml
 # --- Experiment cofigurations --------------------------------------------------------------------
-train_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP.txt
-validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP.txt
+train_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_507_copy_OWP.txt
+validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_507_copy_OWP.txt
 test_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP.txt
 
 
@@ -9,19 +9,19 @@ run_dir: /home/mhshah1/runs/persistent_4basins_seq_sweep
 experiment_name: persistent_4basins
 
 
-train_start_date: '01/01/2010'
-train_end_date: '30/09/2013'
-validation_start_date: '01/10/2013'
-validation_end_date: '30/09/2014'
-test_start_date: '01/10/2014'
-test_end_date: '30/09/2015'
+train_start_date: '01/10/1990'
+train_end_date: '30/09/2003'
+validation_start_date: '01/10/2003'
+validation_end_date: '30/09/2008'
+test_start_date: '01/06/1986'
+test_end_date: '30/11/1986'
 
 seed: 111
 device: cuda:1
 
 # --- Validation configuration ---------------------------------------------------------------------
 validate_every: 3
-validate_n_random_basins: 100
+validate_n_random_basins: 
 cache_validation_data: True
 metrics:
   - NSE
@@ -99,9 +99,15 @@ save_weights_every: 5
 save_validation_results: False
 
 # --- Data configurations --------------------------------------------------------------------------
-dataset: fifteenmin_camels_us
+
+
+
+#dataset: camels_us          #for daily data
+dataset: hourly_camels_us
 data_dir: /mnt/disk1/CAMELS_US/
-forcings: aorc_hourly
+forcings: nldas_hourly
+#forcings: nldas          #for daily data
+dataset: fifteenmin_camels_us
 
 
 # NEW: run the whole experiment at 15-minute timestep
@@ -112,14 +118,21 @@ qobs_15min_dir: /mnt/disk1/CAMELS_US/15min
 
 
 dynamic_inputs:
-  - APCP_surface
-  - TMP_2maboveground
-  - DLWRF_surface
-  - DSWRF_surface
-  - PRES_surface
-  - SPFH_2maboveground
-  - UGRD_10maboveground
-  - VGRD_10maboveground
+ #- convective_fraction
+ #- longwave_radiation
+ #- potential_energy
+ #- potential_evaporation
+ #- pressure
+ - shortwave_radiation
+ #- specific_humidity
+ - temperature
+ - total_precipitation
+ #- wind_u
+ #- wind_v
+  #- PRCP(mm/day)   #for daily data
+  #- SRAD(W/m2)   #for daily data
+  #- Tmax(C)      #for daily data
+  #- Tmin(C)       #for daily data
 
 target_variables:  ["qobs_cfs"]
 
