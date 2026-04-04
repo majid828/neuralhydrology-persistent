@@ -124,16 +124,15 @@ dynamic_inputs:
 target_variables:  ["qobs_cfs"]
 
 static_attributes:
-  - ari_ix_mean
-  - slp_dg_mean
-  - centroid_y
-  - ims_pc_mean
-  - ele_mt_mean
-  - snd_pct
-  - cly_pct
-  - for_pc_forest_sse
-  - lka_pc_sse
-  - areasqkm
+ - carbonate_rocks_frac
+ - geol_porostiy
+ - geol_permeability
+ - sand_frac
+ - silt_frac
+ - clay_frac
+ - elev_mean
+ - slope_mean
+ - area_gages2
 
 # --- Persistent sampling configuration ------------------------------------------------------------
 non_overlapping_sequences: true
