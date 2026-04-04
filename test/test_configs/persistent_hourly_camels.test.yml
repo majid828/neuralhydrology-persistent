@@ -21,7 +21,7 @@ device: cuda:1
 
 # --- Validation configuration ---------------------------------------------------------------------
 validate_every: 3
-validate_n_random_basins: 
+validate_n_random_basins: 500
 cache_validation_data: True
 metrics:
   - NSE
