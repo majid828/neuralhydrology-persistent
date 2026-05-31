@@ -1,0 +1,165 @@
+# --- Experiment cofigurations --------------------------------------------------------------------
+#train_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_507_copy_OWP.txt
+#validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_507_copy_OWP.txt
+
+
+train_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+test_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+
+
+run_dir: /home/mhshah1/runs/persistent_4basins_seq_sweep
+experiment_name: persistent_4basins
+
+
+train_start_date: '01/01/1990'
+train_end_date: '30/09/2008'
+validation_start_date: '01/10/2008'
+validation_end_date: '30/09/2012'
+test_start_date: '01/10/2012'
+test_end_date: '30/10/2013'
+
+#train_start_date: '01/01/1980'
+#train_end_date: '30/09/1990'
+#validation_start_date: '01/10/2003'
+#validation_end_date: '30/09/2008'
+
+
+#seed: 999
+device: cuda:1
+
+# --- Validation configuration ---------------------------------------------------------------------
+validate_every: 3
+validate_n_random_basins: 500
+cache_validation_data: True
+metrics:
+  - NSE
+  - KGE
+  - Alpha-NSE
+  - Beta-NSE
+
+# --- Model configuration --------------------------------------------------------------------------
+model: persistentlstm
+#model: cudalstm
+head: regression
+output_activation: linear
+
+hidden_size: 256
+initial_forget_bias: 3
+output_dropout: 0.4
+
+persistent_state: true
+nan_handling_method: masked
+
+
+# --- Evaluation warm-up -----------------------------------------------------------------
+eval_warmup_steps: 90
+
+
+optimizer: Adam
+loss: MSE
+
+learning_rate:
+ # 0: 0.0001
+  #2: 0.0009
+  #3: 0.000
+  #6: 0.0007
+  #7: 0.0001
+  #10: 0.0001
+#  10: 0.00009
+ # 15: 0.00009
+ # 18: 0.00003
+#  18: 0.00003
+  #27: 0.00001
+
+
+#learning_rate:
+  0: 0.001
+  12: 0.0001
+  15: 0.00007
+  #19: 0.00001
+  #25: 0.00001
+
+batch_size: 8
+epochs: 30
+clip_gradient_norm: 1
+
+seq_length: &SEQ 2
+predict_last_n: *SEQ
+
+#seq_length:
+ #15min: &SEQ 16
+
+#predict_last_n:
+ # 15min: *SEQ
+
+num_workers: 8
+log_interval: 50
+log_tensorboard: False
+log_n_figures: 0
+save_weights_every: 5
+save_validation_results: False
+
+# --- Data configurations --------------------------------------------------------------------------
+
+
+
+dataset: camels_us          #for daily data
+#dataset: hourly_camels_us
+data_dir: /mnt/disk1/CAMELS_US/
+#forcings: nldas_hourly
+forcings: nldas          #for daily data
+#dataset: fifteenmin_camels_us
+
+
+# NEW: run the whole experiment at 15-minute timestep
+#use_frequencies: ["15min"]
+
+# NEW: tell the dataset where your TRUE 15-min discharge (target) lives
+#qobs_15min_dir: /mnt/disk1/CAMELS_US/15min
+
+#nldas: PRCP(mm/day) SRAD(W/m2) SWE(mm) Tmax(C) Tmin(C) Vp(Pa) Tmean(C)
+dynamic_inputs:
+ #- convective_fraction
+ #- longwave_radiation
+ #- potential_energy
+ #- potential_evaporation
+ #- pressure
+ #- shortwave_radiation
+ #- specific_humidity
+ #- temperature
+ #- total_precipitation
+ #- wind_u
+ #- wind_v
+ - PRCP(mm/day)   #for daily data
+ - SRAD(W/m2)   #for daily data
+ #- Tmax(C)      #for daily data
+ #- Tmin(C)       #for daily data
+ - Vp(Pa)
+ - Tmean(C)
+
+
+#aorc
+
+
+ #['APCP_surface', 'DLWRF_surface', 'DSWRF_surface', 'PRES_surface', 'SPFH_2maboveground', 'TMP_2maboveground', 'UGRD_10mabovegro']
+#target_variables:  ["qobs_cfs"]
+target_variables:
+ #["qobs_cfs"]
+- QObs(mm/d) #daily
+#- qobs_mm_per_hour #nldas
+static_attributes:
+# - carbonate_rocks_frac
+ - geol_porostiy
+ - geol_permeability
+ - sand_frac
+ - silt_frac
+ - clay_frac
+ - elev_mean
+ - slope_mean
+ - area_gages2
+
+# --- Persistent sampling configuration ------------------------------------------------------------
+non_overlapping_sequences: true
+seq_stride: *SEQ
+
