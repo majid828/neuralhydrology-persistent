@@ -46,3 +46,22 @@ This repository is a derivative of the original NeuralHydrology package. The ori
   url = {https://doi.org/10.21105/joss.04050}
 }
 
+## Manuscript configuration files
+
+The configuration files used to generate the manuscript results are provided in:
+
+`test/test_configs/`
+
+The following configuration files were used for the experiments reported in the manuscript:
+
+| Configuration file | Purpose |
+|---|---|
+| `persistent_lstm_hourly.test.yml` | Persistent LSTM experiment using hourly hydrological data |
+| `persistent_lstm_15_mint.test.yml` | Persistent LSTM experiment using 15-minute hydrological data |
+| `persistent_lstm_for_long_memory_basins.test.yml` | Persistent LSTM experiment for long-memory basin analysis |
+| `persistent_lstm_nonstationary_basins.test.yml` | Persistent LSTM experiment for nonstationary basin analysis |
+| `cuda_lstm_for_long_memory_basins.test.yml` | Standard CUDA LSTM comparison for long-memory basins |
+| `cuda_lstm_nonstationary_basins.test.yml` | Standard CUDA LSTM comparison for nonstationary basins |
+| `mts_lstm_hourly.test.yml` | Multi-timescale LSTM experiment using hourly hydrological data |
+
+These files define the model settings used in the manuscript, including the model type, basin selection, input features, training period, validation period, test period, sequence length, batch size, and other training options.
