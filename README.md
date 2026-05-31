@@ -1,5 +1,41 @@
 ![#](docs/source/_static/img/neural-hyd-logo-black.png)
 
+cff-version: 1.2.0
+message: "If you use this Persistent LSTM extension, please cite it using the metadata below and also cite the original NeuralHydrology software."
+title: "Persistent LSTM Extension for NeuralHydrology"
+authors:
+  - family-names: "Shah"
+    given-names: "Majid Hussain"
+year: 2026
+repository-code: "https://github.com/majid828/neuralhydrology-persistent"
+license: "MIT"
+abstract: "Persistent LSTM extension of the NeuralHydrology framework for sequence-free hydrological training with persistent hidden-state handling."
+keywords:
+  - hydrology
+  - LSTM
+  - persistent states
+  - NeuralHydrology
+  - rainfall-runoff modeling
+references:
+  - type: article
+    authors:
+      - family-names: "Kratzert"
+        given-names: "Frederik"
+      - family-names: "Gauch"
+        given-names: "Martin"
+      - family-names: "Nearing"
+        given-names: "Grey"
+      - family-names: "Klotz"
+        given-names: "Daniel"
+    title: "NeuralHydrology -- A Python library for Deep Learning research in hydrology"
+    journal: "Journal of Open Source Software"
+    year: 2022
+    volume: 7
+    issue: 71
+    doi: "10.21105/joss.04050"
+
+
+
 Python library to train neural networks with a strong focus on hydrological applications.
 
 This package has been used extensively in research over the last years and was used in various academic publications. 
