@@ -1,0 +1,91 @@
+  train_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+  validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+  test_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+
+  run_dir: /home/mhshah1/runs/persistent_4basins_seq_sweep/persistent_seed_555_0705_054126
+  experiment_name: persistent_15min_seed_555
+
+  train_start_date: "1990-01-01 00:00:00"
+  train_end_date: "2008-09-30 00:00:00"
+  validation_start_date: "2008-10-01 00:00:00"
+  validation_end_date: "2012-09-30 00:00:00"
+  test_start_date: "2012-10-01 00:00:00"
+  test_end_date: "2013-10-30 00:00:00"
+
+  dataset: fifteenmin_camels_us
+  data_dir: /mnt/disk1/CAMELS_US
+  forcings: nldas_hourly
+  qobs_15min_dir: /mnt/disk1/CAMELS_US/15min
+  use_frequencies:
+    - 15min
+
+  model: persistentlstm
+  head: regression
+  output_activation: linear
+  hidden_size: 256
+  initial_forget_bias: 3
+  output_dropout: 0.4
+  persistent_state: true
+  nan_handling_method: masked
+
+  seq_length:
+    15min: 24
+  predict_last_n:
+    15min: 24
+  non_overlapping_sequences: true
+  seq_stride: 24
+  eval_warmup_steps: 2880
+
+  dynamic_inputs:
+    - convective_fraction
+    - longwave_radiation
+    - potential_energy
+    - potential_evaporation
+    - pressure
+    - shortwave_radiation
+    - specific_humidity
+    - temperature
+    - total_precipitation
+    - wind_u
+    - wind_v
+
+  target_variables:
+    - qobs_cfs
+
+  static_attributes:
+    - geol_porostiy
+    - geol_permeability
+    - sand_frac
+    - silt_frac
+    - clay_frac
+    - elev_mean
+    - slope_mean
+    - area_gages2
+
+  optimizer: Adam
+  loss: MSE
+  learning_rate:
+    0: 0.001
+    12: 0.0001
+    15: 0.00007
+
+  batch_size: 16
+  epochs: 30
+  clip_gradient_norm: 1
+  metrics:
+    - NSE
+    - KGE
+    - Alpha-NSE
+    - Beta-NSE
+
+  seed: 555
+  device: cuda:1
+  num_workers: 8
+  validate_every: 3
+  validate_n_random_basins: 500
+  cache_validation_data: true
+  save_weights_every: 5
+  save_validation_results: false
+  log_tensorboard: false
+  log_interval: 50
+  log_n_figures: 0
