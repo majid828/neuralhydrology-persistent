@@ -1,0 +1,86 @@
+# --- Experiment configurations --------------------------------------------------------------------
+train_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+test_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+
+run_dir: /home/mhshah1/runs/cudalstm_daily_compare
+experiment_name: cudalstm_daily_compare
+
+train_start_date: '01/01/1990'
+train_end_date: '30/09/2008'
+validation_start_date: '01/10/2008'
+validation_end_date: '30/09/2012'
+test_start_date: '01/10/2012'
+test_end_date: '30/10/2013'
+
+#seed: 777
+device: cuda:1
+
+# --- Validation configuration ---------------------------------------------------------------------
+validate_every: 3
+validate_n_random_basins: 500
+cache_validation_data: True
+
+metrics:
+  - NSE
+  - KGE
+  - Alpha-NSE
+  - Beta-NSE
+
+# --- Model configuration --------------------------------------------------------------------------
+model: cudalstm
+head: regression
+output_activation: linear
+
+hidden_size: 256
+initial_forget_bias: 3
+output_dropout: 0.4
+nan_handling_method: masked
+
+optimizer: Adam
+loss: MSE
+
+learning_rate:
+  0: 0.001
+  15: 0.0003
+  22: 0.00007
+  28: 0.00005
+
+batch_size: 256
+epochs: 30
+clip_gradient_norm: 1
+
+seq_length: 365
+predict_last_n: 1
+
+num_workers: 8
+log_interval: 50
+log_tensorboard: False
+log_n_figures: 0
+save_weights_every: 5
+save_validation_results: False
+
+# --- Data configurations --------------------------------------------------------------------------
+dataset: camels_us
+data_dir: /mnt/disk1/CAMELS_US/
+forcings: nldas
+
+dynamic_inputs:
+ - PRCP(mm/day)   #for daily data
+ - SRAD(W/m2)   #for daily data
+ #- Tmax(C)      #for daily data
+ #- Tmin(C)       #for daily data
+ - Vp(Pa)
+ - Tmean(C)
+target_variables:
+  - QObs(mm/d)
+
+static_attributes:
+  - geol_porostiy
+  - geol_permeability
+  - sand_frac
+  - silt_frac
+  - clay_frac
+  - elev_mean
+  - slope_mean
+  - area_gages2
