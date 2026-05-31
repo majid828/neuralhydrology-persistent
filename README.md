@@ -3,9 +3,6 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20479712.svg)](https://doi.org/10.5281/zenodo.20479712)
 
-This repository contains the Persistent LSTM implementation developed for the manuscript:
-
-**Sequence-Free LSTM Training for Long-Term Hydrological States**
 
 This code is derived from the open-source NeuralHydrology framework and extends its training workflow by adding persistent hidden-state handling across sequential hydrological batches. The main goal is to allow the LSTM to carry hydrological memory across non-overlapping sequences, instead of resetting the hidden and cell states for every training sequence.
 
