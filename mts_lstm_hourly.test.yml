@@ -1,0 +1,108 @@
+  dataset: hourly_camels_us
+  data_dir: /mnt/disk1/CAMELS_US
+  forcings: nldas_hourly
+
+  train_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+  validation_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+  test_basin_file: /mnt/disk1/CAMELS_US/basin_lists/list_250_OWP6.txt
+
+  run_dir: runs/persistent_seed_444_0705_155710
+  experiment_name: mts_hourly_seed_444
+
+  train_start_date: "1990-01-01 00:00:00"
+  train_end_date: "2008-09-30 00:00:00"
+  validation_start_date: "2008-10-01 00:00:00"
+  validation_end_date: "2012-09-30 00:00:00"
+  test_start_date: "2012-10-01 00:00:00"
+  test_end_date: "2013-10-30 00:00:00"
+
+  model: mtslstm
+  head: regression
+  output_activation: linear
+  output_dropout: 0.4
+  initial_forget_bias: 3
+
+  hidden_size:
+    1D: 64
+    1h: 64
+
+  seq_length:
+    1D: 365
+    1h: 336
+
+  predict_last_n:
+    1D: 1
+    1h: 24
+
+  use_frequencies:
+    - 1D
+    - 1h
+
+  regularization:
+    - tie_frequencies
+
+  transfer_mtslstm_states:
+    h: linear
+    c: linear
+
+  shared_mtslstm: false
+  zero_center_target: true
+
+  dynamic_inputs:
+    - convective_fraction
+    - longwave_radiation
+    - potential_energy
+    - potential_evaporation
+    - pressure
+    - shortwave_radiation
+    - specific_humidity
+    - temperature
+    - total_precipitation
+    - wind_u
+    - wind_v
+
+  target_variables:
+    - qobs_mm_per_hour
+
+  static_attributes:
+    - geol_porostiy
+    - geol_permeability
+    - sand_frac
+    - silt_frac
+    - clay_frac
+    - elev_mean
+    - slope_mean
+    - area_gages2
+
+  optimizer: Adam
+  loss: NSE
+  learning_rate:
+    0: 0.001
+    12: 0.0001
+    15: 0.00007
+
+  batch_size: 256
+  epochs: 30
+  metrics:
+    - NSE
+    - KGE
+    - Alpha-NSE
+    - Beta-NSE
+
+  seed: 444
+  device: cuda:1
+  num_workers: 8
+  validate_every: 3
+  validate_n_random_basins: 507
+  cache_validation_data: true
+
+  save_weights_every: 1
+  save_validation_results: false
+  log_tensorboard: false
+  log_interval: 5
+  log_n_figures: 0
+  allow_subsequent_nan_losses: 10
+  checkpoint_path: null
+
+  clip_targets_to_zero:
+    - qobs_mm_per_hour
